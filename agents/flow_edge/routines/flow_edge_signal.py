@@ -22,6 +22,16 @@ class Config(BaseModel):
 
     connector_name: str = Field(default="hyperliquid_perpetual", description="Exchange connector")
     trading_pair: str = Field(default="XRP-USD", description="Trading pair")
+    candle_connector: str = Field(
+        default="",
+        description="Connector used to fetch candles; falls back to connector_name when empty. "
+                    "Use this when the execution connector does not serve candle data (e.g. derive_perpetual).",
+    )
+    candle_trading_pair: str = Field(
+        default="",
+        description="Trading pair used for candle data; falls back to trading_pair when empty. "
+                    "Use when the candle connector quotes a different asset (e.g. XRP-USDT on binance_perpetual).",
+    )
     fast_interval: str = Field(default="3m", description="Signal timeframe")
     slow_interval: str = Field(default="15m", description="Regime timeframe")
     fast_max_records: int = Field(
@@ -408,13 +418,19 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     if not client:
         return "FLOWEDGE SIGNAL: no Hummingbot API server available — cannot compute. HOLD."
 
+    # derive_perpetual and similar venues do not serve candle data.
+    # Allow a proxy connector so the signal can be computed from a liquid reference feed
+    # (e.g. binance_perpetual XRP-USDT) while orders are placed on the execution connector.
+    candle_connector = config.candle_connector or config.connector_name
+    candle_pair = config.candle_trading_pair or config.trading_pair
+
     try:
         fast_raw = await client.market_data.get_candles(
-            config.connector_name, config.trading_pair, config.fast_interval,
+            candle_connector, candle_pair, config.fast_interval,
             config.fast_max_records,
         )
         slow_raw = await client.market_data.get_candles(
-            config.connector_name, config.trading_pair, config.slow_interval,
+            candle_connector, candle_pair, config.slow_interval,
             config.slow_max_records,
         )
     except Exception as e:  # noqa: BLE001 — surface as text, never raise into the tick
@@ -442,20 +458,21 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     c = signal["components"]
     lines = [
         f"FLOWEDGE SIGNAL — {config.trading_pair} @ {config.connector_name}",
-        f"price          : {signal['price']}",
-        f"decision       : {signal['direction']}  ({signal['reason']})",
-        f"score          : {signal['score']:+.3f}   threshold {config.signal_threshold:.2f}",
-        f"entry_gate     : {signal['entry_gate']}",
-        (f"exit_liquidity : {'OK' if signal['exit_liquidity']['ok'] else 'THIN — ' + signal['exit_liquidity']['note']}"
+        f"  candle source  : {candle_pair} @ {candle_connector}",
+        f"  price          : {signal['price']}",
+        f"  decision       : {signal['direction']}  ({signal['reason']})",
+        f"  score          : {signal['score']:+.3f}   threshold {config.signal_threshold:.2f}",
+        f"  entry_gate     : {signal['entry_gate']}",
+        (f"  exit_liquidity : {'OK' if signal['exit_liquidity']['ok'] else 'THIN — ' + signal['exit_liquidity']['note']}"
          if signal["exit_liquidity"]["checked"]
-         else f"exit_liquidity : unknown ({signal['exit_liquidity']['note']})"),
-        f"regime slow    : {signal['slow_regime']} (ADX {signal['slow_adx']})",
-        f"regime fast    : {signal['fast_regime']} (ADX {signal['fast_adx']})",
-        f"components     : cfi {c['cfi']:+.3f} | vwap {c['vwap']:+.3f} | "
+         else f"  exit_liquidity : unknown ({signal['exit_liquidity']['note']})"),
+        f"  regime slow    : {signal['slow_regime']} (ADX {signal['slow_adx']})",
+        f"  regime fast    : {signal['fast_regime']} (ADX {signal['fast_adx']})",
+        f"  components     : cfi {c['cfi']:+.3f} | vwap {c['vwap']:+.3f} | "
         f"trend {c['trend']:+.3f} | di {c['di']:+.3f} | funding {c['funding']:+.3f}",
-        f"natr           : {signal['natr_pct']:.3f}%  -> vol multiplier {signal['vol_multiplier']:.2f}x",
-        f"rsi            : {signal['rsi']:.1f}",
-        f"funding_rate   : {signal['funding_rate']}",
+        f"  natr           : {signal['natr_pct']:.3f}%  -> vol multiplier {signal['vol_multiplier']:.2f}x",
+        f"  rsi            : {signal['rsi']:.1f}",
+        f"  funding_rate   : {signal['funding_rate']}",
     ]
 
     if ladder:
