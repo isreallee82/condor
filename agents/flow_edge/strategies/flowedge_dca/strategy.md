@@ -17,8 +17,8 @@ default_config:
   candle_trading_pair: XRP-USD
   leverage: 2
   risk_limits:
-    max_position_size_quote: 300
-    max_open_executors: 4
+    max_position_size_quote: 140
+    max_open_executors: 2
     max_drawdown_pct: 8
 default_trading_context: Trade XRP-USDC on derive_perpetual, 2x leverage, one-way
   mode.
@@ -45,8 +45,9 @@ Call the `flow_edge_signal` routine, forwarding the ACTIVE values from
 your config, and each omission has its own consequence:
 
 - Omit `total_amount_quote` and it defaults to **0**, which the routine reads as
-  "not supplied": it builds **no ladder at all** and prints
-  `budget : 0.00 quote ... — NOT SUPPLIED`. You get a diagnosis, never an entry.
+  "not supplied": it prints `budget : 0.00 quote ... — NOT SUPPLIED`, reports
+  `exit_liquidity : UNVERIFIED (NOT_SIZED)` because a zero requirement is met by any
+  book, and builds **no ladder at all**. You get a diagnosis, never an entry.
 - Omit `leverage` and it defaults to **1**, and that 1 is written verbatim into the
   JSON block you are told to submit unedited — a 1x executor against a 2x session.
 - Omit `candle_connector` and the candle feed falls back to `connector_name`. That
@@ -65,16 +66,16 @@ It returns a text block. It appends a JSON object under `READY-TO-SUBMIT
 dca_executor FIELDS` **only** when all four of these hold: `decision` is not HOLD,
 `exit_liquidity` is `VERIFIED OK`, a budget was supplied, and the execution venue
 returned a live price. `VERIFIED THIN` is a real measurement and still yields no
-block. When any of those fails the routine prints a `No ladder emitted — <reason>`
-line instead: read it, it names the gate that stopped it. No block means no entry —
-see rule 9.
+block. When any of those fails the routine prints its reason instead —
+`No ladder produced — the decision is HOLD.`, or `No ladder emitted — <reason>`
+naming the gate that stopped it. No block means no entry — see rule 9.
 
 | Field | Meaning |
 |---|---|
 | `decision` | `LONG`, `SHORT` or `HOLD` — already gated on regime and threshold |
 | `score` | Blended signal in [-1, 1] |
 | `entry_gate` | `both` / `slow` / `fast` / `none` / `halt` |
-| `exit_liquidity` | Rendered as `VERIFIED OK` or `VERIFIED THIN` (the book was read and measured) or `UNVERIFIED (<CODE>)` (the book was not read at all; `<CODE>` says why — older builds spell it `unknown (...)`). Match the **whole** prefix: `UNVERIFIED` contains `VERIFIED` as a substring, and reading one for the other turns the blocking state into the passing one |
+| `exit_liquidity` | Rendered as `VERIFIED OK` or `VERIFIED THIN` (the book was read *and* judged against your exit size) or `UNVERIFIED (<CODE>)` (no verdict — the book was not read, or was read against no size at all; `<CODE>` says which). `VERIFIED OK` means the depth was measured, not that the venue will accept the close. Match the **whole** prefix: `UNVERIFIED` contains `VERIFIED` as a substring, and reading one for the other turns the blocking state into the passing one |
 | `slow_regime`, `fast_regime` | `TRENDING` / `RANGING` / `EXTREME` |
 | `components` | Per-feature contributions: cfi, vwap, trend, di, funding |
 | `natr_pct`, `vol_multiplier` | Live volatility and the resulting scaling factor |
@@ -98,44 +99,18 @@ First match wins.
 3. **`decision` is HOLD** → do nothing, journal the reason in one line.
 4. **`entry_gate` is `halt`** → the slow frame is `EXTREME`. Open nothing until it
    clears. `EXTREME` on the *fast* frame alone is not a halt.
-5. **`exit_liquidity` is not a measurement** — `UNVERIFIED (<CODE>)`, or
-   `unknown (<note>)` from an older routine build → the book was never read, so you
-   have **no** liquidity reading. **Always: do not open**, whatever the code (rule 9
-   covers the ladder itself). What the `<CODE>` means, and therefore what you
-   journal and what may be written to `learnings.md`, differs by code — read the
-   code you were handed rather than assuming last week's cause:
-
-   - `BACKEND_UNREACHABLE` / `VENUE_UNREACHABLE` / `TRANSPORT_TIMEOUT` /
-     `API_ERROR` → a fact about the **connection**, not about the venue: the API
-     server could not reach the exchange, or did not answer in time. The routine
-     already prints a `connectivity` line naming the server and saying which of the
-     order-book, funding and candle probes answered — read that instead of spending
-     a tool call re-deriving it, and do **not** re-run the signal against another
-     connector. Journal once per outage (Error recovery step 3), do **not** switch
-     connector or pair, and do **not** write a venue/pair/connector-name conclusion
-     into `learnings.md`.
-   - `EMPTY_BOOK` → the venue **answered** and returned no bids or no asks. That is
-     a fact about the venue and the pair, and the strongest do-not-trade-this-pair
-     evidence there is. Journal it as such; if it repeats, that **does** belong in
-     `learnings.md` as a statement about this pair on this venue.
-   - `BAD_REQUEST` (HTTP 400/404/422) → the API answered and **rejected** the
-     request: for that endpoint the connector name or the pair genuinely may be
-     wrong. Support is per **endpoint**, not per connector — `derive_perpetual` is
-     in the trading catalogue and serves funding, while its candles endpoint returns
-     HTTP 400 and its order book never answers. Journal which endpoint rejected
-     which connector and pair, and record that in `learnings.md`. Still do **not**
-     change the ACTIVE `connector_name` or `trading_pair` yourself — `[CURRENT
-     CONFIG]` outranks you; say the config needs an operator fix.
-   - `MALFORMED_BOOK` → a defect in **our own parser**, not an outage and not a
-     venue fact. Journal it as a routine bug with the reported detail and conclude
-     nothing about the venue, the pair or the market.
-   - `UNKNOWN` / `NOT_RUN` → unclassified. Journal the code and detail verbatim and
-     conclude nothing.
-6. **`exit_liquidity` is `VERIFIED THIN`** → do not open. The entry would fill and
-   the exit would be refused, leaving a position you cannot close. Journal the
-   reported figure. If it stays thin for several ticks **with a measured figure in
-   the note**, say so — that is a real depth reading, and the size or the pair is
-   worth a line in `learnings.md`. An unread book is not a thin book; see rule 5.
+5. **`exit_liquidity` carries no verdict** — `UNVERIFIED (<CODE>)` → the book was
+   not read, or was read against no exit size, so you have **no** liquidity reading
+   either way. **Do not open**, whatever the code (rule 9 covers the ladder itself).
+   Then read the `<CODE>`: it decides what you journal and whether anything belongs
+   in `learnings.md`. See *What the UNVERIFIED codes mean* below — the codes do not
+   share one cause, so do not assume last week's.
+6. **`exit_liquidity` is `VERIFIED THIN`** → do not open. The book was measured and
+   does not hold your exit size, so the entry would fill into a position the book
+   cannot absorb on the way out. Journal the reported figure. If it stays thin for
+   several ticks **with a measured figure in the note**, say so — that is a real
+   depth reading, and the size or the pair is worth a line in `learnings.md`. An
+   unread book is not a thin book; see rule 5.
 7. **At `max_open_executors`, or an active executor on the same side** → do not
    stack. Journal and wait.
 8. **Opposite-side executor active** → do not hedge yourself. Let it finish.
@@ -144,11 +119,68 @@ First match wins.
    never submit, improvise, hand-size or reconstruct a ladder the routine did not
    emit — not from the prices in the text block, not from a previous tick's block,
    not from an older build that still printed one. The routine withholds the block
-   for a reason it states on the `No ladder emitted — <reason>` line (HOLD, exit
-   book not `VERIFIED OK`, no budget forwarded, no live execution-venue price).
+   for a reason it prints: `No ladder produced — the decision is HOLD.`, otherwise
+   `No ladder emitted — <reason>`, which names the gate — an exit book that is not
+   `VERIFIED OK`, including `NOT_SIZED` when no budget was forwarded.
    Journal that reason in one line; if it is a missing config key, fix Step 1 next
    tick rather than filling the gap yourself.
 10. **Otherwise** → open the ladder per Step 4.
+
+### What the `UNVERIFIED` codes mean
+
+Rule 5 blocks the entry for every code. The code decides the diagnosis:
+
+- `BACKEND_UNREACHABLE` / `VENUE_UNREACHABLE` / `API_ERROR` → a fact about the
+  **connection**, not about the venue: the API server could not reach the
+  exchange, or the call failed in transit. The routine already prints a
+  `connectivity` line naming the server and saying which of the order-book,
+  funding and candle probes answered — read that instead of spending a tool call
+  re-deriving it, and do **not** re-run the signal against another connector.
+  Journal it once per outage rather than once per tick, do **not** switch connector
+  or pair, and do **not** conclude in `learnings.md` that this venue or pair is
+  unsupported.
+- `TRANSPORT_TIMEOUT` → the probe was accepted and never answered. Not an outage on
+  its own: the one time it fired for real the server could reach the venue and the
+  pair had simply never been **subscribed** — local tracker state, not a connection
+  fact. (A hang stringifies to nothing, so the message arrives empty; that emptiness
+  says nothing.) The routine already tests that cheap cause: on this code only it
+  runs one `add_trading_pair` plus one retry and prints the outcome on an
+  `order-book heal  :` line in the connectivity block — **take that line's verdict**.
+  It says whether the subscription was the cause (the retry recovered), whether it is
+  ruled out (subscribed, timed out again → the fault is further along the path), or
+  whether it is still open (the subscribe itself failed). Do not suspect what it has
+  settled, and do not ask an operator for `add_trading_pair`: this tick already ran
+  it. The line prints on a **healthy** tick too — connectivity OK because the retry
+  worked — and that tick is the proof the pair was unsubscribed; the subscription is
+  runtime state an API container restart loses. A subscription finding is worth a
+  line in `learnings.md`; an outage or "this venue cannot serve depth" is not.
+- `EMPTY_BOOK` → the venue **answered** and returned no bids or no asks. That is a
+  fact about this read, and it blocks the entry. Before recording it as a property
+  of the pair, check `get_order_book_diagnostics(<connector>)`: a tracker that was
+  never subscribed or has only just come up can also answer empty, and the
+  routine's self-heal does **not** run for this code. If it repeats with the
+  tracker ready and the pair subscribed, that **does** belong in `learnings.md` as
+  a statement about this pair on this venue.
+- `BAD_REQUEST` (HTTP 400/404/422) → the API answered and **rejected** the
+  request: for that endpoint the connector name or the pair genuinely may be
+  wrong. Support is per **endpoint**, not per connector — `derive_perpetual` is
+  in the trading catalogue and serves funding and (once the pair is subscribed)
+  order-book depth, while its candles endpoint returns HTTP 400. Journal which
+  endpoint rejected which connector and pair, and record that in `learnings.md`.
+  Retrying will not fix it; a config change will. If it is the **candle** feed that
+  was rejected, fix it with `candle_connector` / `candle_trading_pair` in Step 1 —
+  never by moving the trade. Do **not** change the ACTIVE `connector_name` or
+  `trading_pair` yourself: `[CURRENT CONFIG]` outranks you, so keep executing
+  there and say the config needs an operator fix.
+- `MALFORMED_BOOK` → a defect in **our own parser**, not an outage and not a
+  venue fact. Journal it as a routine bug with the reported detail and conclude
+  nothing about the venue, the pair or the market.
+- `NOT_SIZED` → the book **was** read, but you sent no `total_amount_quote`, so
+  there was no exit size to test it against and nothing about depth is verified
+  (any book clears a zero requirement). This one is yours to fix: forward the
+  budget in Step 1 next tick. Conclude nothing about the venue or the pair.
+- `UNKNOWN` / `NOT_RUN` → unclassified. Journal the code and detail verbatim and
+  conclude nothing.
 
 ### Skip-tick conditions
 
@@ -164,10 +196,11 @@ is none, rule 9 applies and there is nothing to submit.
 
 First check `sum(amounts_quote) <= total_amount_quote`, allowing 0.01 quote of
 rounding slack (the routine rounds each rung to 4 dp independently, so an exact
-split can land a hair over). Over by more than that means you did not forward
-`total_amount_quote` in Step 1 — re-run Step 1 with it rather than editing the JSON
-by hand. If the re-run returns the same over-budget numbers, HOLD and journal the
-figures: that is a routine bug, not something to hand-trim.
+split can land a hair over). Over by more than that means a larger figure than the
+session's `total_amount_quote` was forwarded in Step 1, or the split itself is wrong
+— re-run Step 1 with the ACTIVE value rather than editing the JSON by hand. If the
+re-run returns the same over-budget numbers, HOLD and journal the figures: that is a
+routine bug, not something to hand-trim.
 
 Do not recompute prices or barriers — they are already volatility-scaled and
 fee-floored. If the routine's prices violate the direction rule against the live
@@ -192,7 +225,8 @@ breakeven price. It is yours until you close it.
 
 ## Journaling
 
-Exactly one line per tick via `trading_agent_journal_write`:
+One line per tick via `trading_agent_journal_write`, except where this playbook
+says to journal once per condition instead:
 
 `Tick #N: <ACTION> — <one-clause reason>. score <x>, gate <y>, regime <z>. [exposure]`
 

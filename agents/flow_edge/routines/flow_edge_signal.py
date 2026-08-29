@@ -25,6 +25,24 @@ ADX_LENGTH = 14
 # rate. Ten seconds is far more than a healthy venue needs and bounds the loss.
 PROBE_TIMEOUT_SEC = 10.0
 
+# The order-book probe gets ONE self-heal attempt per tick, and only on a
+# timeout. A pair that was never SUBSCRIBED makes get_order_book hang to the
+# full cap with no error at all — diagnostics on the real failure showed
+# tracker_ready false, websocket_status not_connected, trading_pairs [] and all
+# eight listener tasks absent — and that, not an outage, is what blocked this
+# agent for its entire life. add_trading_pair is idempotent and market-data
+# only: it starts a feed, it places nothing. (restart_order_book_tracker is no
+# use in that state — with nothing subscribed it answers "No trading pairs to
+# restart".) SUBSCRIBE_READY_SEC is the wait the API is asked to do server-side
+# for the tracker to come up; SUBSCRIBE_TIMEOUT_SEC is our own cap around the
+# call and is deliberately LONGER, so the server gets to answer instead of
+# being cut off mid-flight — a cancelled subscribe would tell us nothing about
+# whether it worked. A tick that times out and cannot heal therefore costs
+# 10 + 12 + 10 on the book and 10 on funding — bounded, and still well under the
+# 120s+ that two UNCAPPED probes cost before any of this existed.
+SUBSCRIBE_READY_SEC = 8
+SUBSCRIBE_TIMEOUT_SEC = 12.0
+
 
 class Config(BaseModel):
     """FlowEdge signal — dual-timeframe ADX regime, volatility-normalised score, sized DCA ladder."""
@@ -603,10 +621,55 @@ def _build_ladder(config: Config, signal: dict) -> tuple[dict | None, str]:
     }, ""
 
 
-async def _exit_liquidity(client, connector_name: str, trading_pair: str,
-                         notional: float, band_pct: float,
-                         cap: float = PROBE_TIMEOUT_SEC) -> dict:
-    """Can the book absorb the exit we are about to owe?
+async def _subscribe_trading_pair(client, connector_name: str, trading_pair: str,
+                                  cap: float = SUBSCRIBE_TIMEOUT_SEC) -> tuple[bool, str]:
+    """Ask the API to subscribe `trading_pair` on `connector_name`. Never raises.
+
+    Returns (accepted, detail). True means the API did not report a failure —
+    that is an ACCEPT, not a verified live feed (see the body check below).
+    This is a market-data call — it starts an order-book feed and places no
+    order, moves no funds and changes no account state — and it is idempotent:
+    calling it for a pair already subscribed is a no-op. It is the one remedy
+    for the hang described in the SUBSCRIBE_READY_SEC comment above, and like
+    every other probe here it is advisory: a failure to subscribe is reported,
+    never raised into the tick.
+    """
+    try:
+        result = await asyncio.wait_for(
+            client.market_data.add_trading_pair(
+                connector_name, trading_pair, timeout=SUBSCRIBE_READY_SEC,
+            ),
+            timeout=cap,
+        )
+    except Exception as e:  # noqa: BLE001 — a failed remedy must not break the tick
+        code, detail = _probe_error(e, cap)
+        logger.warning("add_trading_pair failed on %s %s: %s: %s",
+                       connector_name, trading_pair, code, detail)
+        return False, f"{code}: {detail}"
+    # The endpoint reports its own outcome in the body; a 200 is not by itself a
+    # subscription. Only an explicit failure is read as a failure — every other
+    # body shape is reported as ACCEPTED, which is exactly what it is and no
+    # more. The payload shape is not ours to depend on, so callers must say "the
+    # API accepted the call" and never "the pair is subscribed": what actually
+    # confirms a live feed is get_order_book_diagnostics (tracker_ready /
+    # websocket_status / trading_pairs), or a retried probe that reads a book.
+    if isinstance(result, dict):
+        status = str(result.get("status", result.get("state", ""))).lower()
+        message = str(result.get("message", result.get("detail", "")) or "")
+        if status in ("error", "failed", "failure") or result.get("success") is False:
+            logger.warning("add_trading_pair refused on %s %s: %s",
+                           connector_name, trading_pair, message or result)
+            return False, f"the API refused the subscription: {message or result}"
+        return True, message or (status or "accepted")
+    return True, "accepted"
+
+
+async def _read_exit_book(client, connector_name: str, trading_pair: str,
+                          notional: float, band_pct: float,
+                          cap: float = PROBE_TIMEOUT_SEC) -> dict:
+    """One attempt at reading the exit book. Callers go through _exit_liquidity.
+
+    Can the book absorb the exit we are about to owe?
 
     The entry is a resting maker ladder and always fills politely. The exit is a
     market order, and a venue will reject it outright when there is no liquidity
@@ -692,9 +755,316 @@ async def _exit_liquidity(client, connector_name: str, trading_pair: str,
     return out
 
 
+async def _exit_liquidity(client, connector_name: str, trading_pair: str,
+                          notional: float, band_pct: float,
+                          cap: float = PROBE_TIMEOUT_SEC) -> dict:
+    """_read_exit_book, plus ONE self-heal attempt when the probe times out.
+
+    The only failure this repairs is the one that actually happened: the pair
+    was never subscribed, so the order-book tracker had no feed and the request
+    hung to the cap with no error. The remedy is a single idempotent,
+    market-data-only add_trading_pair followed by one retry of the probe.
+
+    It is attempted ONLY for TRANSPORT_TIMEOUT, and only for the order book.
+    Every other code is a different fault and subscribing cannot touch it: a
+    BAD_REQUEST is the API refusing this connector or pair on this endpoint, a
+    MALFORMED_BOOK is a defect in our own parser, an EMPTY_BOOK was answered,
+    and BACKEND_UNREACHABLE means the call never landed. Once per tick, never
+    in a loop: if subscribing did not fix it the first time it will not fix it
+    the second, and a retry loop would spend the whole tick budget.
+
+    The outcome is recorded under "heal" and printed on the connectivity block,
+    because a probe that silently repairs itself is a probe whose evidence the
+    agent cannot read: the pair being unsubscribed is itself the diagnosis, and
+    the subscription is RUNTIME state that does not survive an API restart.
+
+    "recovered" means one thing only: the retry actually READ a book. A retry
+    that fails some OTHER way is reported as the different fault it is — never
+    as a repair, and never with a cause the retry did not establish.
+    """
+    heal = {"attempted": False, "subscribed": False, "recovered": False, "note": ""}
+    out = await _read_exit_book(client, connector_name, trading_pair,
+                                notional, band_pct, cap)
+    if out.get("code") == "TRANSPORT_TIMEOUT":
+        heal["attempted"] = True
+        call = f"add_trading_pair({connector_name}, {trading_pair})"
+        subscribed, detail = await _subscribe_trading_pair(client, connector_name,
+                                                           trading_pair)
+        heal["subscribed"] = subscribed
+        if not subscribed:
+            heal["note"] = (
+                f"{call} was ATTEMPTED after the timeout and FAILED ({detail}), so the pair "
+                f"could not be subscribed and the hang is still unexplained — treat the "
+                f"timeout as unresolved."
+            )
+        else:
+            retry = await _read_exit_book(client, connector_name, trading_pair,
+                                          notional, band_pct, cap)
+            if retry.get("code") == "TRANSPORT_TIMEOUT":
+                # "ACCEPTED", not "SUCCEEDED", and "less likely", not "ruled
+                # out": _subscribe_trading_pair reports success for any body it
+                # does not recognise as a refusal, so it cannot certify that the
+                # feed came up. The conclusion below names the endpoint that can.
+                heal["note"] = (
+                    f"{call} was ACCEPTED ({detail}) but the retried probe timed out AGAIN — "
+                    f"that makes an unsubscribed tracker the LESS likely explanation, though an "
+                    f"accepted call is not proof the feed came up. The timeout is unresolved."
+                )
+            elif retry.get("checked"):
+                # Recovery is gated on the retry having actually READ and parsed
+                # a book — `checked` is set only after bids and asks came off a
+                # real payload (OK / THIN / NOT_SIZED). Branching instead on
+                # "the code is no longer TRANSPORT_TIMEOUT" declared
+                # BACKEND_UNREACHABLE, VENUE_UNREACHABLE, BAD_REQUEST,
+                # MALFORMED_BOOK and EMPTY_BOOK all "recovered", and printed
+                # "not unreachable" three lines under a probe line reading
+                # BACKEND_UNREACHABLE: a confident wrong cause, stated in-band.
+                heal["recovered"] = True
+                heal["note"] = (
+                    f"the first probe timed out; {call} was ACCEPTED ({detail}) and the retry "
+                    f"then READ the book ({retry.get('code')}) — so the hang was an UNSUBSCRIBED "
+                    f"pair with no feed, not an unreachable venue. The subscription is runtime "
+                    f"state and is lost on an API container restart, so expect this again "
+                    f"after one."
+                )
+                out = retry
+            else:
+                # The subscribe was accepted and the retry still did not read a
+                # book: it failed a DIFFERENT way. That establishes nothing about
+                # what caused the original timeout, so nothing here claims it —
+                # the new code is named and the agent is sent to that code's own
+                # conclusion, which is written for that fault.
+                heal["note"] = (
+                    f"{call} was ACCEPTED ({detail}) but the retry did NOT read a book either — "
+                    f"it came back {retry.get('code')}, a DIFFERENT fault from the timeout. "
+                    f"Subscribing did not restore the probe, and the cause of the timeout is "
+                    f"NOT established by this. What stands now is {retry.get('code')} — act on "
+                    f"its conclusion below, not on the timeout."
+                )
+                out = retry
+        logger.warning("order book self-heal on %s %s: %s",
+                       connector_name, trading_pair, heal["note"])
+    out["heal"] = heal
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+
+# How each probe fault code is explained to the agent. The conclusion under the
+# connectivity block used to be ONE unconditional paragraph — "INFRASTRUCTURE
+# fault ... it is NOT thin liquidity and NOT a venue/pair mismatch ... both are
+# valid connector names ... do NOT change connector_name" — printed for every
+# non-OK code. That is the same confident wrong root cause the classifier above
+# exists to remove, only supplied by us instead of invented by the agent, and it
+# was wrong for three of the four cases it covered: BAD_REQUEST is the API
+# REJECTING the request (the one code where the connector or the pair really may
+# be wrong for that endpoint), MALFORMED_BOOK is a defect in our own parser, and
+# EMPTY_BOOK is a genuine book condition — the opposite of "not thin liquidity".
+# So the conclusion is chosen from the code.
+_FAULT_CLASS = {
+    "BACKEND_UNREACHABLE": "infra",
+    "TRANSPORT_TIMEOUT": "infra",
+    "VENUE_UNREACHABLE": "infra",
+    "API_ERROR": "infra",
+    "BAD_REQUEST": "rejected",
+    "MALFORMED_BOOK": "parser",
+    "EMPTY_BOOK": "book",
+    "UNKNOWN": "unclassified",
+}
+
+
+def _fault_conclusion(cls: str, server: str, config: Config, probes: list[str],
+                      book_ok: bool, funding_ok: bool, book_timeout: bool = False,
+                      heal: dict | None = None) -> list[str]:
+    """The paragraph the agent acts on, written for ONE fault class only.
+
+    `probes` names the probes that failed with THIS class, so nothing here is
+    asserted about a probe that did not: on a mixed tick — the order book
+    rejected, funding timed out — a single paragraph would have to call the same
+    tick both "rejected" and "never answered", and one of the two would be false.
+
+    No branch tells the agent that a connector name is valid. Support on this API
+    is PER-ENDPOINT — the trading catalogue lists connectors the market-data
+    endpoints refuse (derive_perpetual serves funding, refuses candles, and hung
+    on the order book until its pair was subscribed) — so "it is a real
+    connector" is not evidence that the endpoint we just called accepts it, and a
+    single blanket cause for every failure on a venue is not a thing that exists.
+
+    `book_timeout` is passed separately from the class rather than derived from
+    it: "infra" can be carried by the funding probe alone, and the subscription
+    advice below is only true of the order book.
+    """
+    lead = "                   => "
+    cont = "                      "
+    which = " and ".join(probes) or "probe"
+    book_hit = "order-book" in probes
+    if cls == "rejected":
+        head = (f"{lead}The API REJECTED the {which} probe (HTTP 400/404/422) — it answered, so "
+                f"this is not an outage.")
+        if book_hit:
+            head += " Nothing at all was measured about liquidity."
+        return [
+            head,
+            f"{cont}CHECK connector_name and trading_pair against the API's own error text above: "
+            f"this endpoint may not accept '{config.connector_name}', or may not carry "
+            f"{config.trading_pair} on it.",
+            f"{cont}Support is PER-ENDPOINT here — a connector the trading catalogue lists can "
+            f"still be refused by market-data — so do not conclude the name is fine because "
+            f"another endpoint took it.",
+            f"{cont}Retrying will not fix it; a config change will. If {config.connector_name} is "
+            f"the venue the user chose, keep EXECUTING there and source the missing data from a "
+            f"proxy feed (candle_connector / candle_trading_pair) instead of moving the trade.",
+        ]
+    if cls == "parser":
+        detail = (" Order-book levels are normalised by _normalize_levels." if book_hit else "")
+        return [
+            f"{lead}MALFORMED_BOOK on the {which} probe is a defect in OUR OWN parsing — not a "
+            f"venue fault and not a network fault. The API answered; this routine could not read "
+            f"the payload shape it returned.{detail}",
+            f"{cont}Do not journal it as an outage and do not change connector_name or "
+            f"trading_pair — neither touches it. Report the payload shape so the routine can be "
+            f"fixed.",
+        ]
+    if cls == "book":
+        lines = [
+            f"{lead}EMPTY_BOOK is a real BOOK condition on {config.connector_name} "
+            f"{config.trading_pair}: the venue answered and reported no bids, or no asks. It is "
+            f"not an outage, and not a parser bug.",
+        ]
+        if (heal or {}).get("attempted"):
+            # This tick STARTED the feed: the first probe timed out, the routine
+            # subscribed the pair, and the book was read seconds later. A tracker
+            # that has just come up and not yet populated answers exactly like a
+            # market with no orders in it — the same warm-up class of fault the
+            # book_timeout paragraph exists to name before an outage. It is named
+            # first here for the same reason: a repeat of this line gets journalled
+            # as a permanent fact about the pair.
+            lines.append(
+                f"{cont}But this routine SUBSCRIBED the pair seconds earlier, on this same tick "
+                f"(see the order-book heal line above), and a tracker that has just been "
+                f"subscribed and has not populated yet returns an empty book too. That is the "
+                f"cheaper explanation and it is UNTESTED: re-read the book next tick, with the "
+                f"feed already up, before recording anything about this pair's liquidity."
+            )
+            lines.append(
+                f"{cont}If it is STILL empty then, it is thin liquidity at its limit and the "
+                f"strongest do-not-trade-this-pair evidence there is — a position opened here "
+                f"could not be closed."
+            )
+        else:
+            lines.append(
+                f"{cont}That is thin liquidity at its limit and the strongest "
+                f"do-not-trade-this-pair evidence there is — a position opened here could not "
+                f"be closed."
+            )
+        return lines
+    if cls == "unclassified":
+        return [
+            f"{lead}The {which} probe raised an exception this routine does not classify, so the "
+            f"cause is NOT known. Read the type and message above, and do not infer a root cause "
+            f"from silence.",
+        ]
+    # "infra" — the case that is actually happening in production.
+    lines = [
+        f"{lead}INFRASTRUCTURE fault on the path from server '{server}' to "
+        f"{config.connector_name}, seen by the {which} probe — not a market condition.",
+        f"{cont}This class of failure is not a rejection: a connector or pair an endpoint does not "
+        f"accept comes back as HTTP 400/404/422. Here the request was taken and never answered, or "
+        f"failed in transit.",
+    ]
+    if book_hit:
+        # Only claimable when the ORDER-BOOK probe is one of these failures. If
+        # the book was read and it is funding that died, "no book was read" would
+        # be a false statement about the evidence — and the per-endpoint line
+        # below already says which half failed.
+        lines.append(
+            f"{cont}It therefore says nothing whatever about the book — it is NOT thin liquidity, "
+            f"because no book was read at all."
+        )
+    if book_timeout:
+        # The actual cause, the one time this fired for real: the pair had never
+        # been SUBSCRIBED, so the tracker had no feed and the request hung to the
+        # cap with no error — tracker_ready false, websocket_status
+        # not_connected, trading_pairs [], every listener task absent. Once the
+        # pair was added the same book returned ~19,000 quote of depth within
+        # 0.5% of the mid. Six journal entries blamed an outage instead. So the
+        # cheap explanation is named FIRST, and the expensive one only after the
+        # cheap one has been tested.
+        heal = heal or {}
+        lines.append(
+            f"{cont}A TIMEOUT on the order book is NOT by itself evidence of an outage: a "
+            f"tracker whose pair was never SUBSCRIBED hangs in exactly this way — no error, "
+            f"no data, just the cap — and that is what it turned out to be last time."
+        )
+        if heal.get("subscribed"):
+            # heal["subscribed"] is only as strong as _subscribe_trading_pair's
+            # read of the response body, which reports True for any answer it
+            # does not recognise as an explicit refusal. That is an ACCEPT, not a
+            # confirmed live feed, so this says what was observed and points at
+            # the endpoint that can actually settle it.
+            lines.append(
+                f"{cont}This routine called add_trading_pair for the pair this tick and the API "
+                f"ACCEPTED it, then retried and timed out again (see the order-book heal line "
+                f"above). That is evidence AGAINST an unsubscribed tracker but not proof — an "
+                f"accepted call is not a confirmation that the feed came up. Confirm with "
+                f"market_data.get_order_book_diagnostics({config.connector_name}) — "
+                f"tracker_ready, websocket_status, trading_pairs — before concluding the "
+                f"server's link to the venue is at fault, and still do not change "
+                f"connector_name or trading_pair."
+            )
+        elif heal.get("attempted"):
+            lines.append(
+                f"{cont}This routine tried to subscribe the pair this tick and could not "
+                f"(see the order-book heal line above), so the subscription is NOT ruled "
+                f"out. Read market_data.get_order_book_diagnostics("
+                f"{config.connector_name}) — tracker_ready, websocket_status, "
+                f"trading_pairs — before concluding the venue is down."
+            )
+        else:
+            lines.append(
+                f"{cont}Check it: market_data.get_order_book_diagnostics("
+                f"{config.connector_name}) reports tracker_ready / websocket_status / "
+                f"trading_pairs, and market_data.add_trading_pair({config.connector_name}, "
+                f"{config.trading_pair}) subscribes it. Suspect that BEFORE an outage."
+            )
+    if book_ok or funding_ok:
+        alive, dead = ("order-book", "funding") if book_ok else ("funding", "order-book")
+        lines.append(
+            f"{cont}The {alive} probe DID answer for {config.connector_name} "
+            f"{config.trading_pair}, so the server's route to this venue works — the fault is "
+            f"confined to the {dead} endpoint, which this API supports per-endpoint."
+        )
+    lines += [
+        f"{cont}Do NOT change connector_name or trading_pair to \"fix\" this: they are the venue "
+        f"and pair the user configured, and changing them trades something else. Do not re-run the "
+        f"signal against another venue,",
+        f"{cont}and journal it once per outage rather than once per tick.",
+    ]
+    return lines
+
+
+def _heal_lines(liq: dict) -> list[str]:
+    """Report the order-book self-heal, so it is visible rather than magic.
+
+    Printed on a healthy tick too: when the retry READ the book, connectivity
+    reads "OK" and the single most useful fact of the tick — that the pair was
+    not subscribed until this routine subscribed it, and will not be again after
+    an API container restart — would otherwise vanish exactly when it was proved.
+
+    The line leads with RECOVERED / NOT RECOVERED, straight off heal["recovered"],
+    so a heal that repaired nothing cannot be skim-read as one that did.
+    """
+    heal = (liq or {}).get("heal") or {}
+    if not heal.get("attempted"):
+        return []
+    # The one-word verdict is read off heal["recovered"] — the same flag
+    # _exit_liquidity sets ONLY when the retry actually read a book — so the
+    # status and the note it heads can never disagree.
+    status = "RECOVERED" if heal.get("recovered") else "NOT RECOVERED"
+    return [f"                   order-book heal  : {status} — {heal.get('note', '')}"]
+
 
 def _connectivity_lines(server: str, config: Config, candle_connector: str,
                         candle_pair: str, candle_bars: int, liq: dict,
@@ -710,17 +1080,21 @@ def _connectivity_lines(server: str, config: Config, candle_connector: str,
     to fill the gap — six consecutive journal entries blaming a venue/pair
     mismatch, one tick run off-config against a different connector, and a false
     claim written into learnings.md. So the conclusion is stated in-band, every
-    tick, rather than left to be inferred.
+    tick, rather than left to be inferred — but it is BRANCHED on the fault code
+    (see _FAULT_CLASS / _fault_conclusion), because one fixed conclusion for
+    every code is exactly the invented root cause this block exists to stop.
     """
-    book_ok = liq["state"] in ("OK", "THIN")
+    # `checked` is true only after the book was actually read and parsed, so it
+    # also covers NOT_SIZED (read, but no size to judge it against) — that is an
+    # exit-liquidity verdict, not a connectivity fault, and belongs in the
+    # exit_liquidity line rather than here.
+    book_ok = bool(liq.get("checked"))
     funding_ok = funding_code in ("OK", "NO_FUNDING")
     if book_ok and funding_ok:
         return [f"  connectivity   : OK — server '{server}' is serving "
-                f"{config.connector_name} {config.trading_pair}"]
+                f"{config.connector_name} {config.trading_pair}",
+                *_heal_lines(liq)]
 
-    source = f"{candle_connector} {candle_pair}"
-    if candle_connector != config.connector_name:
-        source = f"a DIFFERENT connector ({source})"
     book_desc = "OK" if book_ok else f"{liq['code']} ({liq['detail']})"
     if funding_code == "OK":
         funding_desc = "OK"
@@ -728,33 +1102,81 @@ def _connectivity_lines(server: str, config: Config, candle_connector: str,
         funding_desc = f"OK — venue reports no funding ({funding_detail})"
     else:
         funding_desc = f"{funding_code} ({funding_detail})"
-    # "cannot serve" only when both probes are down; one live probe proves the
-    # route works and narrows the fault to a single endpoint.
-    verb = "cannot serve" if not (book_ok or funding_ok) else "is only partly serving"
-    return [
-        f"  connectivity   : DEGRADED — server '{server}' {verb} "
-        f"{config.connector_name} {config.trading_pair}",
+
+    # {fault class: the probes that failed with it} — each conclusion is then
+    # attributed to the probes it is actually true of.
+    faults: dict[str, list[str]] = {}
+    if not book_ok:
+        faults.setdefault(_FAULT_CLASS.get(liq["code"], "unclassified"), []).append("order-book")
+    if not funding_ok:
+        faults.setdefault(_FAULT_CLASS.get(funding_code, "unclassified"), []).append("funding")
+    classes = set(faults)
+    # REACHABLE, not DEGRADED, when every fault we hold is one the API ANSWERED:
+    # a rejection, a defect in our parser, or an empty book. Labelling those
+    # "DEGRADED connectivity" sends the agent hunting an outage that is not there.
+    if not (classes & {"infra", "unclassified"}):
+        head = (f"  connectivity   : REACHABLE — server '{server}' answered for "
+                f"{config.connector_name} {config.trading_pair}; the fault below is not a "
+                f"connectivity problem")
+    elif not (book_ok or funding_ok):
+        # "cannot serve" only when both probes are down; one live probe proves
+        # the route works and narrows the fault to a single endpoint.
+        head = (f"  connectivity   : DEGRADED — neither the order-book nor the funding probe "
+                f"returned usable data from server '{server}' for {config.connector_name} "
+                f"{config.trading_pair}")
+    else:
+        head = (f"  connectivity   : DEGRADED — server '{server}' is only partly serving "
+                f"{config.connector_name} {config.trading_pair}")
+
+    if candle_connector != config.connector_name or candle_pair != config.trading_pair:
+        candles_line = (f"                   candles          : OK — {candle_bars} bars from a "
+                        f"DIFFERENT feed ({candle_connector} {candle_pair}), so the server itself "
+                        f"is alive")
+    else:
+        # Same connector AND same pair: the candles are not an independent
+        # control. Printing "cannot serve X" directly above "150 bars from X"
+        # reads as a contradiction, and the old conclusion then went on to name
+        # the same connector twice as "both valid connector names".
+        candles_line = (f"                   candles          : OK — {candle_bars} bars from the "
+                        f"SAME connector and pair; no proxy feed is configured, so this is NOT an "
+                        f"independent control — it shows only that the candles endpoint accepts "
+                        f"{candle_connector} {candle_pair}")
+
+    lines = [
+        head,
         f"                   order-book probe : {book_desc}",
         f"                   funding probe    : {funding_desc}",
-        f"                   candles          : OK — {candle_bars} bars from {source}",
-        f"                   => INFRASTRUCTURE fault on the path from server '{server}' to "
-        f"{config.connector_name}, not a market condition.",
-        f"                      It is NOT thin liquidity and NOT a venue/pair mismatch: "
-        f"{config.connector_name} and {candle_connector} are both valid connector",
-        f"                      names on this API, and {config.trading_pair} is the configured "
-        f"pair. Do NOT change connector_name or trading_pair to \"fix\" this,",
-        "                      do not re-run the signal against another venue, and journal it "
-        "once per outage rather than once per tick.",
+        *_heal_lines(liq),
+        candles_line,
     ]
+    # Only the ORDER-BOOK probe timing out licenses the subscription advice; a
+    # funding timeout is the same class but a different endpoint.
+    book_timeout = (not book_ok) and liq.get("code") == "TRANSPORT_TIMEOUT"
+    for cls in ("rejected", "parser", "book", "infra", "unclassified"):
+        if cls in faults:
+            lines.extend(_fault_conclusion(cls, server, config, faults[cls], book_ok,
+                                           funding_ok, book_timeout=book_timeout,
+                                           heal=liq.get("heal")))
+    return lines
 
 
 def _exit_liquidity_lines(liq: dict, notional: float, band_pct: float) -> list[str]:
     """Render the exit-liquidity verdict.
 
     The word "unknown" never appears: it read as a soft maybe, and the agent
-    treated it as one. An unread book is reported as UNVERIFIED with its fault
-    code and the explicit consequence — no entry.
+    treated it as one. An unread book — and a book read against no size at all —
+    is reported as UNVERIFIED with its fault code and the explicit consequence:
+    no entry.
     """
+    if liq["code"] == "NOT_SIZED":
+        return [
+            f"  exit_liquidity : UNVERIFIED (NOT_SIZED) — the book was read "
+            f"({liq['bid_quote']:,.0f} bid / {liq['ask_quote']:,.0f} ask quote within "
+            f"{band_pct}% of mid) but NO exit size was supplied to test it against,",
+            "                   so nothing is verified — a zero requirement is met by any book, "
+            "including a one-lot one. Pass the session's total_amount_quote in the routine "
+            "config; entry stays blocked until then.",
+        ]
     if liq["state"] == "OK":
         return [f"  exit_liquidity : VERIFIED OK — {liq['bid_quote']:,.0f} bid / "
                 f"{liq['ask_quote']:,.0f} ask quote within {band_pct}% of mid, "
@@ -781,6 +1203,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     candle_connector = config.candle_connector or config.connector_name
     candle_pair = config.candle_trading_pair or config.trading_pair
 
+    # The candle fetch is deliberately NOT capped with asyncio.wait_for the way
+    # the two advisory probes below are — it is the signal's only mandatory
+    # input, so it gets the shared client's own (60s) timeout. That means the cap
+    # handed to _probe_error has to be the time ACTUALLY spent: the default would
+    # render "no response within 10s" after a full minute of waiting, a false
+    # statement about the evidence in the one place built to keep it honest.
+    started = time.monotonic()
     try:
         fast_raw = await client.market_data.get_candles(
             candle_connector, candle_pair, config.fast_interval,
@@ -791,7 +1220,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             config.slow_max_records,
         )
     except Exception as e:  # noqa: BLE001 — surface as text, never raise into the tick
-        code, detail = _probe_error(e)
+        code, detail = _probe_error(e, round(time.monotonic() - started, 1))
         logger.warning("candle fetch failed on %s %s: %s: %s",
                        candle_connector, candle_pair, code, detail)
         return (f"FLOWEDGE SIGNAL: candle fetch failed on {candle_pair} @ {candle_connector} "
@@ -856,6 +1285,21 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                    f"@ {config.leverage}x leverage")
     if config.total_amount_quote <= 0:
         budget_line += " — NOT SUPPLIED, pass total_amount_quote in the routine config"
+    budget_lines = [budget_line]
+    # leverage is emitted inside the block labelled "use these values verbatim",
+    # so a value nobody forwarded must be visible as such rather than passing for
+    # a decision — the same warning the budget already gets. model_fields_set
+    # separates "explicitly passed" from "defaulted"; the <= 1 arm also catches
+    # callers that materialise every default before constructing the config.
+    leverage_supplied = "leverage" in getattr(config, "model_fields_set", set())
+    if not leverage_supplied or config.leverage <= 1:
+        why = ("NOT SUPPLIED in the routine config" if not leverage_supplied
+               else "supplied as 1")
+        budget_lines.append(
+            f"                   leverage {why} — any ladder below asserts "
+            f"\"leverage\": {config.leverage} verbatim; pass the session's configured leverage "
+            f"if it is not {config.leverage}x"
+        )
 
     if funding_code == "OK":
         funding_line = f"  funding_rate   : {signal['funding_rate']}"
@@ -873,7 +1317,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
         f"  candle close   : {signal['candle_close']}  "
         f"(last closed {config.fast_interval} bar of the candle feed)",
         exec_line,
-        budget_line,
+        *budget_lines,
         f"  decision       : {signal['direction']}  ({signal['reason']})",
         f"  score          : {signal['score']:+.3f}   threshold {config.signal_threshold:.2f}",
         f"  entry_gate     : {signal['entry_gate']}",
@@ -897,14 +1341,24 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
         # withheld whenever the exit book is not verified deep enough to close
         # what it would open — the failure that produced 21 entry fills against
         # 3 closes. The decision itself is still reported, so nothing is hidden.
-        state = (f"UNVERIFIED ({liq['code']})" if liq["state"] == "UNVERIFIED"
-                 else "VERIFIED THIN")
-        lines.append(
-            f"No ladder emitted — decision was {signal['direction']} ({signal['score']:+.3f}) "
-            f"but exit_liquidity is {state}. A ladder is emitted only when the exit book is "
-            f"verified deep enough to close the position; entering here risks a position that "
-            f"cannot be exited."
-        )
+        if liq["code"] == "NOT_SIZED":
+            # Distinct from a failed probe and from a thin book: the book was
+            # read fine, there was simply no size to judge it against.
+            lines.append(
+                f"No ladder emitted — decision was {signal['direction']} ({signal['score']:+.3f}) "
+                f"but exit_liquidity is UNVERIFIED (NOT_SIZED): the book was read, and with no "
+                f"total_amount_quote there is no exit size to test it against. Pass the session's "
+                f"total_amount_quote and re-run — nothing here says the book is deep enough."
+            )
+        else:
+            state = (f"UNVERIFIED ({liq['code']})" if liq["state"] == "UNVERIFIED"
+                     else "VERIFIED THIN")
+            lines.append(
+                f"No ladder emitted — decision was {signal['direction']} ({signal['score']:+.3f}) "
+                f"but exit_liquidity is {state}. A ladder is emitted only when the exit book is "
+                f"verified deep enough to close the position; entering here risks a position that "
+                f"cannot be exited."
+            )
     elif ladder is None:
         lines.append(f"No ladder emitted — {refusal}.")
     else:
@@ -912,6 +1366,14 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             f"READY-TO-SUBMIT dca_executor FIELDS (use these values verbatim — sized to the "
             f"{config.total_amount_quote:,.2f} quote budget at {config.leverage}x):"
         )
+        if not leverage_supplied:
+            # In-band at the point of use: the JSON below states a leverage this
+            # routine was never told, and it is pasted as authoritative.
+            lines.append(
+                f"  ! leverage was NOT supplied to this routine and defaulted to "
+                f"{config.leverage} — check it against the session's configured leverage before "
+                f"submitting, and pass it in the routine config so this line stops guessing."
+            )
         lines.append(json.dumps(ladder, indent=2))
 
     return "\n".join(lines)
