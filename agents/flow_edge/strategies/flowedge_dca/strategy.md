@@ -146,11 +146,15 @@ Rule 5 blocks the entry for every code. The code decides the diagnosis:
   says nothing.) The routine already tests that cheap cause: on this code only it
   runs one `add_trading_pair` plus one retry and prints the outcome on an
   `order-book heal  :` line in the connectivity block — **take that line's verdict**.
-  It says whether the subscription was the cause (the retry recovered), whether it is
-  ruled out (subscribed, timed out again → the fault is further along the path), or
-  whether it is still open (the subscribe itself failed). Do not suspect what it has
-  settled, and do not ask an operator for `add_trading_pair`: this tick already ran
-  it. The line prints on a **healthy** tick too — connectivity OK because the retry
+  It prints `RECOVERED` when the retry actually read a book — the subscription *was*
+  the cause. Otherwise it prints `NOT RECOVERED`, and read the rest of that line
+  rather than inferring: an accepted `add_trading_pair` followed by a second timeout
+  makes an unsubscribed tracker **less likely but does not disprove it**, because an
+  accepted call is not proof the feed came up — the timeout stays **unresolved**, so
+  do not promote it to a fault "further along the path" or blame the server's link to
+  the venue. Settle it with `get_order_book_diagnostics(<connector>)` (`tracker_ready`,
+  `websocket_status`, `trading_pairs`) before concluding anything. Do not ask an
+  operator for `add_trading_pair`: this tick already ran it. The line prints on a **healthy** tick too — connectivity OK because the retry
   worked — and that tick is the proof the pair was unsubscribed; the subscription is
   runtime state an API container restart loses. A subscription finding is worth a
   line in `learnings.md`; an outage or "this venue cannot serve depth" is not.
