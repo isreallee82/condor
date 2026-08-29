@@ -20,8 +20,8 @@ ADX_LENGTH = 14
 class Config(BaseModel):
     """FlowEdge signal — dual-timeframe ADX regime, volatility-normalised score, sized DCA ladder."""
 
-    connector_name: str = Field(default="hyperliquid_perpetual", description="Exchange connector")
-    trading_pair: str = Field(default="XRP-USD", description="Trading pair")
+    connector_name: str = Field(default="derive_perpetual", description="Exchange connector")
+    trading_pair: str = Field(default="XRP-USDC", description="Trading pair")
     candle_connector: str = Field(
         default="",
         description="Connector used to fetch candles; falls back to connector_name when empty. "

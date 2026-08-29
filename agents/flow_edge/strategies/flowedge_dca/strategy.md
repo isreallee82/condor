@@ -15,7 +15,7 @@ default_config:
     max_position_size_quote: 300
     max_open_executors: 4
     max_drawdown_pct: -8
-default_trading_context: Trade XRP-USD on hyperliquid_perpetual, 2x leverage, one-way
+default_trading_context: Trade XRP-USDC on derive_perpetual, 2x leverage, one-way
   mode.
 created_by: 5775815348
 created_at: '2026-05-17T08:15:43.839293+00:00'
