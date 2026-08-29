@@ -92,8 +92,10 @@ that opened 21 fills and closed 3.
 always fills politely. The exit is a market order, and a venue rejects it outright
 when there is no liquidity inside its price band — 53 of ~56 closes were refused,
 so positions opened that could not be closed. The routine reports
-`exit_liquidity` every tick for exactly this reason. A position you cannot exit is
-worse than no position, and it is the entry decision that creates it.
+`exit_liquidity` every tick for exactly this reason: `OK` or `THIN` is a measurement
+of the book, while `UNVERIFIED` means the probe never returned — a fact about the
+connection to the API, not about the venue. A position you cannot exit is worse than
+no position, and it is the entry decision that creates it.
 
 **Judge yourself on trades that happened.** An executor that expires having filled
 nothing is not a losing trade — it is evidence about the ladder's reach, not about
@@ -120,4 +122,5 @@ These hold regardless of which playbook you are running.
 - Never exceed the configured `max_open_executors` or `max_position_size_quote`.
 - Slow-frame `EXTREME` overrides everything except closing a position.
 - A held position is yours until you close it. Managing it outranks any new entry.
-- Never open a ladder the book cannot absorb on the way out — see `exit_liquidity`.
+- Never open a ladder the book cannot absorb on the way out, and never one whose
+  exit book you could not measure at all — see `exit_liquidity`.

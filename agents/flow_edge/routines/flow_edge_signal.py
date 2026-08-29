@@ -1,14 +1,16 @@
 """Compute the FlowEdge regime signal and a ready-to-submit DCA ladder."""
 
+import asyncio
 import json
 import logging
 import math
 from typing import Any
 
+import aiohttp
 import numpy as np
 import pandas as pd
-from config_manager import get_client
-from pydantic import BaseModel, Field
+from config_manager import get_client, get_config_manager
+from pydantic import BaseModel, ConfigDict, Field
 from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
@@ -16,9 +18,21 @@ logger = logging.getLogger(__name__)
 CATEGORY = "Analysis"
 ADX_LENGTH = 14
 
+# Cap on every advisory market-data probe. The shared client's own ClientTimeout
+# is 60s total, so two uncapped probes against an unreachable venue cost a 60s
+# tick 120s+ of dead waiting — the agent then ticks at a third of its configured
+# rate. Ten seconds is far more than a healthy venue needs and bounds the loss.
+PROBE_TIMEOUT_SEC = 10.0
+
 
 class Config(BaseModel):
     """FlowEdge signal — dual-timeframe ADX regime, volatility-normalised score, sized DCA ladder."""
+
+    # Reject unknown keys instead of silently dropping them. The caller composes
+    # this config by hand from the session config, and pydantic's default
+    # extra='ignore' quietly discarded leverage / risk_limits / server_name —
+    # so the ladder went out at the venue's account leverage with nobody warned.
+    model_config = ConfigDict(extra="forbid")
 
     connector_name: str = Field(default="derive_perpetual", description="Exchange connector")
     trading_pair: str = Field(default="XRP-USDC", description="Trading pair")
@@ -42,7 +56,25 @@ class Config(BaseModel):
         default=100,
         description="Slow candles to load — must match the controller's slow_max_records",
     )
-    total_amount_quote: float = Field(default=100.0, description="Quote capital for one entry")
+    # Sizing is not this routine's to invent — it belongs to the session budget
+    # (AgentConfig.total_amount_quote) and has to be passed in. The old default
+    # of 100.0 sized every ladder to 100 against a 70 budget, inside a block the
+    # routine itself labels "use these values verbatim", and also asked the
+    # exit-liquidity probe about a notional nobody was going to trade. 0 means
+    # "not supplied" and _build_ladder refuses to build. It is a zero default
+    # rather than a required field only because routines/base.py's
+    # get_default_config() constructs Config() with no arguments to render the
+    # settings menu, and a required field would raise there.
+    total_amount_quote: float = Field(
+        default=0.0,
+        description="Quote capital for one entry — pass the session's total_amount_quote; "
+                    "no ladder is emitted while this is 0",
+    )
+    leverage: int = Field(
+        default=1,
+        description="Leverage the dca_executor is created with — pass the session's "
+                    "configured leverage; it is emitted verbatim in the ladder",
+    )
 
     signal_threshold: float = Field(default=0.30, description="Score needed to fire an entry")
     adx_trending_threshold: float = Field(default=22.0, description="ADX above this = trending")
@@ -152,8 +184,13 @@ def _adx_di(df: pd.DataFrame, length: int = ADX_LENGTH) -> tuple[float, float]:
 
 
 def _classify(adx: float, trending: float, extreme: float) -> str:
+    # NaN means "could not be computed" — a short, empty or wrong-shaped frame —
+    # which is not the same claim as "computed, and the market is calm".
+    # Returning RANGING here disabled the strategy's only risk-off filter exactly
+    # when its input was missing, so unknown gets its own label and the entry
+    # gate treats it as a halt.
     if math.isnan(adx):
-        return "RANGING"
+        return "UNKNOWN"
     if adx >= extreme:
         return "EXTREME"
     if adx >= trending:
@@ -183,22 +220,142 @@ def _to_frame(result: Any) -> pd.DataFrame:
     return df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
 
 
-async def _fetch_funding(client, connector_name: str, trading_pair: str) -> float | None:
-    """Live funding rate, or None on spot / when the venue does not report it."""
+def _normalize_levels(raw: Any) -> list[list[float]]:
+    """Coerce order-book levels to [[price, amount], ...].
+
+    The API returns levels as 2-tuples on most connectors, as longer tuples on
+    some, and as {"price": .., "amount": ..} dicts on others; the sibling
+    market_making_expert/market_analyzer routine normalises the same shapes.
+    Without this, a shape change raises out of the depth probe and gets reported
+    with the same words as a network outage — a bug in us wearing an outage's
+    clothes. Anything unparseable still raises, and _probe_error labels it
+    MALFORMED_BOOK precisely so the two can never be confused again.
+    """
+    levels: list[list[float]] = []
+    for entry in raw or []:
+        if isinstance(entry, dict):
+            price = entry.get("price", entry.get("p"))
+            amount = entry.get("amount", entry.get("quantity", entry.get("size", entry.get("s"))))
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            price, amount = entry[0], entry[1]
+        else:
+            continue
+        if price is None or amount is None:
+            continue
+        price, amount = float(price), float(amount)
+        if amount > 0:
+            levels.append([price, amount])
+    return levels
+
+
+# ---------------------------------------------------------------------------
+# Probe error taxonomy
+#
+# Every market-data probe below is advisory and must never raise into the tick,
+# but "it failed" is not enough: the agent reads this text and has to decide
+# whether it is looking at a thin book, a wrong pair, or a dead backend. So
+# failures are classified by exception TYPE and by the HTTP status the API
+# returned — NEVER by str(e). The failure mode actually occurring in production
+# is the client's 60s total timeout, which raises a bare TimeoutError whose
+# str() is the EMPTY STRING: a note built from str(e) alone rendered as literally
+# empty parentheses, and the agent, handed no evidence, invented a root cause and
+# ran off-config against another venue. type(e).__name__ is therefore always
+# included, so an empty-stringifying exception can never render as "()" again.
+# ---------------------------------------------------------------------------
+
+def _probe_error(e: BaseException, cap: float = PROBE_TIMEOUT_SEC) -> tuple[str, str]:
+    """Classify a probe failure as (code, human-readable detail).
+
+    No code here ever means "OK". Every one of them means the observation could
+    not be made, and for the exit-liquidity check an observation that could not
+    be made is the same as "not safe to enter": a timeout says nothing about the
+    book, and on this venue 53 of ~56 MARKET closes were refused. The executor's
+    own take_profit / stop_loss / time_limit barriers are no fallback — they
+    close with MARKET orders too, the exact order type that was refused.
+    """
+    name = type(e).__name__
+    # ConnectionTimeoutError SUBCLASSES TimeoutError, so it has to be tested
+    # first — otherwise "cannot reach the API host" is reported as "the venue
+    # was slow", which points the agent at the wrong half of the stack.
+    if isinstance(e, aiohttp.ConnectionTimeoutError):
+        return "BACKEND_UNREACHABLE", f"{name}: {e}"
+    if isinstance(e, (aiohttp.ClientConnectorError, aiohttp.ClientOSError,
+                      aiohttp.ServerDisconnectedError)):
+        return "BACKEND_UNREACHABLE", f"{name}: {e}"
+    if isinstance(e, aiohttp.ClientResponseError):
+        # The API answered, so the backend is alive; the status and its message
+        # say whether the exchange behind it is, or whether we asked wrongly.
+        message = e.message or ""
+        detail = f"{name}: HTTP {e.status}: {message or '<no message>'}"
+        if "Cannot connect to host" in message:
+            return "VENUE_UNREACHABLE", detail
+        if e.status in (400, 404, 422):
+            return "BAD_REQUEST", detail
+        return "API_ERROR", detail
+    if isinstance(e, TimeoutError):
+        # asyncio.TimeoutError is the builtin TimeoutError; str() is "".
+        return "TRANSPORT_TIMEOUT", (
+            f"{name}: no response within {cap:g}s — the request was accepted and never answered"
+        )
+    if isinstance(e, (TypeError, ValueError, AttributeError, KeyError, IndexError)):
+        # A defect in OUR parsing, not an outage. Kept distinct so a payload
+        # shape change is never diagnosed as a dead venue.
+        return "MALFORMED_BOOK", f"{name}: {e}"
+    # str() only as a display fallback here — the code is already decided, and
+    # the type name in front of it keeps the note non-empty either way.
+    return "UNKNOWN", f"{name}: {str(e) or '<no message>'}"
+
+
+def _server_label(client) -> str:
+    """Best-effort name of the API server behind `client`.
+
+    The connectivity line has to name the server, or "DEGRADED" reads as a venue
+    problem rather than an infrastructure one. The client only knows its base
+    URL, so ask the ConfigManager which configured server it is and fall back to
+    the URL. A label is never worth breaking a tick over.
+    """
     try:
-        info = await client.market_data.get_funding_info(connector_name, trading_pair)
+        for name, (cached, _verified_at) in getattr(get_config_manager(), "_clients", {}).items():
+            if cached is client:
+                return name
+    except Exception:  # noqa: BLE001 — cosmetic only
+        pass
+    return str(getattr(client, "base_url", "") or "unknown")
+
+
+async def _fetch_funding(client, connector_name: str, trading_pair: str,
+                         cap: float = PROBE_TIMEOUT_SEC) -> tuple[float | None, str, str]:
+    """Live funding rate as (rate, code, detail).
+
+    `code` is "OK" when the venue answered with a rate, "NO_FUNDING" when it
+    answered but reports none (spot, or a perp that simply does not publish one),
+    and a `_probe_error` code when the probe itself failed.
+
+    Those three used to collapse into a bare None, printed as `funding_rate:
+    None` — indistinguishable from a venue that legitimately has no funding, and
+    logged at debug level so it was invisible in normal operation. That threw
+    away one of the two independent live observations that the execution venue
+    is unreachable, which is exactly the evidence the agent needed.
+    """
+    try:
+        info = await asyncio.wait_for(
+            client.market_data.get_funding_info(connector_name, trading_pair),
+            timeout=cap,
+        )
     except Exception as e:  # noqa: BLE001 — a missing funding feed is not fatal
-        logger.debug("funding info unavailable: %s", e)
-        return None
+        code, detail = _probe_error(e, cap)
+        logger.warning("funding probe failed on %s %s: %s: %s",
+                       connector_name, trading_pair, code, detail)
+        return None, code, detail
     if not isinstance(info, dict):
-        return None
+        return None, "NO_FUNDING", "venue returned no funding payload"
     for key in ("rate", "funding_rate", "fundingRate", "next_funding_rate"):
         if info.get(key) is not None:
             try:
-                return float(info[key])
+                return float(info[key]), "OK", ""
             except (TypeError, ValueError):
-                return None
-    return None
+                return None, "NO_FUNDING", f"unparseable funding value {info[key]!r}"
+    return None, "NO_FUNDING", "venue does not report a funding rate"
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +452,11 @@ def _compute_signal(config: Config, fast: pd.DataFrame, slow: pd.DataFrame,
     slow_regime = _classify(slow_adx, config.adx_trending_threshold, config.adx_extreme_threshold)
     fast_regime = _classify(fast_adx, config.adx_trending_threshold, config.adx_extreme_threshold)
     # The slow frame is the risk-off filter — EXTREME there halts everything.
+    # UNKNOWN halts too: an ADX we could not compute is not evidence of a calm
+    # higher timeframe, and treating it as RANGING let the fast frame alone open
+    # the gate with the filter blind (see _classify).
     # EXTREME on the fast frame is a short-term impulse; it just fails to confirm.
-    if slow_regime == "EXTREME":
+    if slow_regime in ("EXTREME", "UNKNOWN"):
         entry_gate = "halt"
     elif (slow_regime == "TRENDING" and fast_regime == "TRENDING"
             and config.allow_fast_regime_entry):
@@ -328,7 +488,12 @@ def _compute_signal(config: Config, fast: pd.DataFrame, slow: pd.DataFrame,
     ))
 
     return {
-        "price": float(fast["close"].iloc[-1]),
+        # The last CLOSED bar of the *candle* feed, which may be a different
+        # connector and a different quote asset from the execution venue. It is
+        # an indicator input, never a price to quote against — run() attaches the
+        # execution venue's own `exec_price` for that. The two are named apart so
+        # they can never be silently swapped again.
+        "candle_close": float(fast["close"].iloc[-1]),
         "score": round(score, 4),
         "direction": direction,
         "reason": reason,
@@ -351,12 +516,31 @@ def _compute_signal(config: Config, fast: pd.DataFrame, slow: pd.DataFrame,
     }
 
 
-def _build_ladder(config: Config, signal: dict) -> dict | None:
-    """Turn the signal into the exact numbers a dca_executor needs."""
-    if signal["direction"] == "HOLD":
-        return None
+def _build_ladder(config: Config, signal: dict) -> tuple[dict | None, str]:
+    """Turn the signal into the exact numbers a dca_executor needs.
 
-    price = signal["price"]
+    Returns (ladder, refusal). `refusal` explains in one clause why no ladder was
+    built, so the caller can print the reason instead of silently omitting the
+    block and leaving the agent to guess whether the market was quiet.
+    """
+    if signal["direction"] == "HOLD":
+        return None, "the decision is HOLD"
+
+    # The rungs are limit prices on the EXECUTION venue, so they have to be
+    # anchored to that venue's own price. The candle close belongs to the proxy
+    # feed and carries cross-venue basis, USDT-vs-USDC quote basis, and up to a
+    # full bar of staleness — regularly more than the near rung's own offset,
+    # which posts a MAKER buy above the market: rejected post-only, or filled as
+    # a taker on a strategy whose take-profit floor is sized for maker fees.
+    price = signal.get("exec_price")
+    if not price or price <= 0:
+        return None, ("no execution-venue price is available — the candle feed is a proxy "
+                      "and must not be used to price limit orders")
+
+    if config.total_amount_quote <= 0:
+        return None, ("no budget supplied — pass the session's total_amount_quote in the "
+                      "routine config; the routine will not invent a size")
+
     mult = signal["vol_multiplier"]
     side = 1 if signal["direction"] == "LONG" else 2
     spreads = list(config.dca_spreads)
@@ -373,15 +557,20 @@ def _build_ladder(config: Config, signal: dict) -> dict | None:
         "side": side,
         "prices": prices,
         "amounts_quote": amounts,
+        # Emitted explicitly: AGENT.md lists leverage as a required dca_executor
+        # field, and this block is meant to be pasted verbatim. Left out, the
+        # executor inherits whatever leverage the account happens to carry.
+        "leverage": config.leverage,
         "stop_loss": round(config.stop_loss * mult, 6),
         "take_profit": round(take_profit, 6),
         "time_limit": config.time_limit,
         "mode": "MAKER",
-    }
+    }, ""
 
 
 async def _exit_liquidity(client, connector_name: str, trading_pair: str,
-                         notional: float, band_pct: float) -> dict:
+                         notional: float, band_pct: float,
+                         cap: float = PROBE_TIMEOUT_SEC) -> dict:
     """Can the book absorb the exit we are about to owe?
 
     The entry is a resting maker ladder and always fills politely. The exit is a
@@ -389,34 +578,138 @@ async def _exit_liquidity(client, connector_name: str, trading_pair: str,
     inside its price band. On derive_perpetual XRP-USDC that killed 53 of ~56
     closes: 21 entry fills against 3 close fills, positions opened that could not
     be exited. Sizing has to be judged against the exit, not the entry.
+
+    `state` is one of:
+      OK          — the book was read and can absorb `notional`
+      THIN        — the book was read and cannot
+      UNVERIFIED  — the book could not be read at all; `code` says why
+    UNVERIFIED is never OK. The failure that defaults to "ok" is the one that
+    opens a position nobody can close. `mid` is kept because it is the only live
+    price this routine ever sees from the execution venue, and it is what the
+    ladder anchors to.
     """
-    out = {"checked": False, "ok": True, "bid_quote": None, "ask_quote": None, "note": ""}
+    out = {"state": "UNVERIFIED", "code": "NOT_RUN", "ok": False, "checked": False,
+           "bid_quote": None, "ask_quote": None, "mid": None, "note": "", "detail": ""}
     try:
-        ob = await client.market_data.get_order_book(connector_name, trading_pair, depth=50)
-        bids = ob.get("bids", []) or []
-        asks = ob.get("asks", []) or []
+        ob = await asyncio.wait_for(
+            client.market_data.get_order_book(connector_name, trading_pair, depth=50),
+            timeout=cap,
+        )
+        bids = _normalize_levels(ob.get("bids", []))
+        asks = _normalize_levels(ob.get("asks", []))
         if not bids or not asks:
-            out["note"] = "empty order book"
+            out.update(code="EMPTY_BOOK",
+                       detail="the venue returned no bids or no asks",
+                       note="EMPTY_BOOK: the venue returned no bids or no asks")
             return out
-        mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+        # The API does not promise sorted levels, and the mid is only the mid if
+        # these really are the best bid and ask.
+        bids.sort(key=lambda level: level[0], reverse=True)
+        asks.sort(key=lambda level: level[0])
+        mid = (bids[0][0] + asks[0][0]) / 2.0
         band = mid * band_pct / 100.0
-        bid_q = sum(float(p) * float(a) for p, a in bids if float(p) >= mid - band)
-        ask_q = sum(float(p) * float(a) for p, a in asks if float(p) <= mid + band)
-        out.update(checked=True, bid_quote=bid_q, ask_quote=ask_q,
-                   ok=min(bid_q, ask_q) >= notional)
-        if not out["ok"]:
+        bid_q = sum(p * a for p, a in bids if p >= mid - band)
+        ask_q = sum(p * a for p, a in asks if p <= mid + band)
+        ok = min(bid_q, ask_q) >= notional
+        out.update(checked=True, ok=ok, mid=mid, bid_quote=bid_q, ask_quote=ask_q,
+                   state="OK" if ok else "THIN", code="OK" if ok else "THIN")
+        if not ok:
             out["note"] = (f"only {min(bid_q, ask_q):,.0f} quote within "
                            f"{band_pct}% of mid, need {notional:,.0f} to exit")
     except Exception as e:  # noqa: BLE001 — advisory only, never break the tick
-        logger.warning("order book probe failed: %s", e)
-        out["note"] = f"depth probe failed ({e})"
+        code, detail = _probe_error(e, cap)
+        # MALFORMED_BOOK is a defect in our own parsing rather than an outage,
+        # so it is logged loudly instead of blending into the warning stream.
+        log = logger.error if code == "MALFORMED_BOOK" else logger.warning
+        log("order book probe failed on %s %s: %s: %s",
+            connector_name, trading_pair, code, detail)
+        out.update(state="UNVERIFIED", code=code, ok=False, checked=False,
+                   detail=detail, note=f"{code}: {detail}")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _connectivity_lines(server: str, config: Config, candle_connector: str,
+                        candle_pair: str, candle_bars: int, liq: dict,
+                        funding_code: str, funding_detail: str) -> list[str]:
+    """Report reachability of the EXECUTION venue as a first-class signal.
+
+    Both probes talk to connector_name/trading_pair while the candles come from a
+    proxy feed, so "candles fine, both probes dead" is the most diagnostic fact
+    the tick has: it isolates the fault to the server's link to the execution
+    venue and rules out the pair, the connector name and market conditions.
+
+    That fact used to be discarded entirely, and the agent invented a root cause
+    to fill the gap — six consecutive journal entries blaming a venue/pair
+    mismatch, one tick run off-config against a different connector, and a false
+    claim written into learnings.md. So the conclusion is stated in-band, every
+    tick, rather than left to be inferred.
+    """
+    book_ok = liq["state"] in ("OK", "THIN")
+    funding_ok = funding_code in ("OK", "NO_FUNDING")
+    if book_ok and funding_ok:
+        return [f"  connectivity   : OK — server '{server}' is serving "
+                f"{config.connector_name} {config.trading_pair}"]
+
+    source = f"{candle_connector} {candle_pair}"
+    if candle_connector != config.connector_name:
+        source = f"a DIFFERENT connector ({source})"
+    book_desc = "OK" if book_ok else f"{liq['code']} ({liq['detail']})"
+    if funding_code == "OK":
+        funding_desc = "OK"
+    elif funding_ok:
+        funding_desc = f"OK — venue reports no funding ({funding_detail})"
+    else:
+        funding_desc = f"{funding_code} ({funding_detail})"
+    # "cannot serve" only when both probes are down; one live probe proves the
+    # route works and narrows the fault to a single endpoint.
+    verb = "cannot serve" if not (book_ok or funding_ok) else "is only partly serving"
+    return [
+        f"  connectivity   : DEGRADED — server '{server}' {verb} "
+        f"{config.connector_name} {config.trading_pair}",
+        f"                   order-book probe : {book_desc}",
+        f"                   funding probe    : {funding_desc}",
+        f"                   candles          : OK — {candle_bars} bars from {source}",
+        f"                   => INFRASTRUCTURE fault on the path from server '{server}' to "
+        f"{config.connector_name}, not a market condition.",
+        f"                      It is NOT thin liquidity and NOT a venue/pair mismatch: "
+        f"{config.connector_name} and {candle_connector} are both valid connector",
+        f"                      names on this API, and {config.trading_pair} is the configured "
+        f"pair. Do NOT change connector_name or trading_pair to \"fix\" this,",
+        "                      do not re-run the signal against another venue, and journal it "
+        "once per outage rather than once per tick.",
+    ]
+
+
+def _exit_liquidity_lines(liq: dict, notional: float, band_pct: float) -> list[str]:
+    """Render the exit-liquidity verdict.
+
+    The word "unknown" never appears: it read as a soft maybe, and the agent
+    treated it as one. An unread book is reported as UNVERIFIED with its fault
+    code and the explicit consequence — no entry.
+    """
+    if liq["state"] == "OK":
+        return [f"  exit_liquidity : VERIFIED OK — {liq['bid_quote']:,.0f} bid / "
+                f"{liq['ask_quote']:,.0f} ask quote within {band_pct}% of mid, "
+                f"need {notional:,.0f} to exit"]
+    if liq["state"] == "THIN":
+        return [f"  exit_liquidity : VERIFIED THIN — {liq['note']}"]
+    return [
+        f"  exit_liquidity : UNVERIFIED ({liq['code']}) — treat as NOT OK, entry is blocked",
+        f"                   {liq['detail']}",
+    ]
 
 
 async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     client = await get_client(context._chat_id, context=context)
     if not client:
         return "FLOWEDGE SIGNAL: no Hummingbot API server available — cannot compute. HOLD."
+    # Named in the connectivity line so a reachability fault is attributed to the
+    # server, not to the venue or the pair.
+    server = _server_label(client)
 
     # derive_perpetual and similar venues do not serve candle data.
     # Allow a proxy connector so the signal can be computed from a liquid reference feed
@@ -434,53 +727,127 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             config.slow_max_records,
         )
     except Exception as e:  # noqa: BLE001 — surface as text, never raise into the tick
-        logger.warning("candle fetch failed: %s", e)
-        return f"FLOWEDGE SIGNAL: candle fetch failed ({e}). HOLD this tick."
+        code, detail = _probe_error(e)
+        logger.warning("candle fetch failed on %s %s: %s: %s",
+                       candle_connector, candle_pair, code, detail)
+        return (f"FLOWEDGE SIGNAL: candle fetch failed on {candle_pair} @ {candle_connector} "
+                f"— {code}: {detail}. HOLD this tick.")
 
     fast = _to_frame(fast_raw)
     slow = _to_frame(slow_raw)
 
+    # +1 everywhere: this check runs on the raw frame, and _closed_bars drops the
+    # forming bar before any indicator sees it. Without the +1, min_bars raw rows
+    # become min_bars-1 usable ones and _adx_di silently returns NaN.
     min_bars = max(config.trend_ema_length, config.rsi_length + 1, ADX_LENGTH * 2)
-    if len(fast) < min_bars:
+    if len(fast) < min_bars + 1:
         return (
             f"FLOWEDGE SIGNAL: only {len(fast)} {config.fast_interval} candles available, "
-            f"need {min_bars} to warm up the indicators. HOLD this tick."
+            f"need {min_bars + 1} to warm up the indicators. HOLD this tick."
+        )
+    # The slow frame had no guard at all, so a cold or restarted 15m feed left
+    # slow_adx NaN — and the regime filter that is supposed to halt trading is
+    # the one thing that must not be silently absent.
+    if len(slow) < ADX_LENGTH * 2 + 1:
+        return (
+            f"FLOWEDGE SIGNAL: only {len(slow)} {config.slow_interval} candles available, "
+            f"need {ADX_LENGTH * 2 + 1} to compute the slow-frame regime filter — without it "
+            f"the EXTREME halt cannot fire. HOLD this tick."
         )
 
-    funding_rate = await _fetch_funding(client, config.connector_name, config.trading_pair)
-    signal = _compute_signal(config, fast, slow, funding_rate)
-    signal["exit_liquidity"] = await _exit_liquidity(
+    # Both probes below hit the EXECUTION connector, are advisory, and cap
+    # themselves (PROBE_TIMEOUT_SEC) so an unreachable venue costs seconds rather
+    # than the client's full 60s timeout — twice per tick.
+    funding_rate, funding_code, funding_detail = await _fetch_funding(
+        client, config.connector_name, config.trading_pair,
+    )
+    liq = await _exit_liquidity(
         client, config.connector_name, config.trading_pair,
         config.total_amount_quote, config.exit_depth_band_pct,
     )
-    ladder = _build_ladder(config, signal)
+
+    signal = _compute_signal(config, fast, slow, funding_rate)
+    signal["exit_liquidity"] = liq
+    # Ladder anchor: the mid the exit probe already read from the EXECUTION
+    # venue. It exists only when that probe succeeded — which is also the only
+    # case in which a ladder is emitted at all, so the two gates line up, and
+    # reusing it spares a second capped call against a possibly dead venue.
+    signal["exec_price"] = liq.get("mid")
+    signal["basis_pct"] = (
+        (liq["mid"] - signal["candle_close"]) / signal["candle_close"] * 100.0
+        if liq.get("mid") and signal["candle_close"] else None
+    )
+    ladder, refusal = _build_ladder(config, signal)
+
+    if signal["exec_price"]:
+        exec_line = (f"  exec price     : {signal['exec_price']:.8g}  "
+                     f"({config.connector_name} mid — the ladder anchor)")
+        if signal["basis_pct"] is not None:
+            exec_line += f"  basis {signal['basis_pct']:+.3f}% vs candle close"
+    else:
+        exec_line = ("  exec price     : UNAVAILABLE — no live price from the execution venue; "
+                     "the candle close is a proxy and cannot price limit orders")
+
+    budget_line = (f"  budget         : {config.total_amount_quote:,.2f} quote per entry "
+                   f"@ {config.leverage}x leverage")
+    if config.total_amount_quote <= 0:
+        budget_line += " — NOT SUPPLIED, pass total_amount_quote in the routine config"
+
+    if funding_code == "OK":
+        funding_line = f"  funding_rate   : {signal['funding_rate']}"
+    elif funding_code == "NO_FUNDING":
+        funding_line = f"  funding_rate   : none reported by the venue ({funding_detail})"
+    else:
+        funding_line = (f"  funding_rate   : UNVERIFIED ({funding_code}) — the funding tilt is "
+                        f"absent from the score")
 
     c = signal["components"]
     lines = [
-        f"FLOWEDGE SIGNAL — {config.trading_pair} @ {config.connector_name}",
-        f"  candle source  : {candle_pair} @ {candle_connector}",
-        f"  price          : {signal['price']}",
+        f"FLOWEDGE SIGNAL — {config.trading_pair} @ {config.connector_name} "
+        f"(execution venue, server '{server}')",
+        f"  candle source  : {candle_pair} @ {candle_connector} (proxy feed — indicators only)",
+        f"  candle close   : {signal['candle_close']}  "
+        f"(last closed {config.fast_interval} bar of the candle feed)",
+        exec_line,
+        budget_line,
         f"  decision       : {signal['direction']}  ({signal['reason']})",
         f"  score          : {signal['score']:+.3f}   threshold {config.signal_threshold:.2f}",
         f"  entry_gate     : {signal['entry_gate']}",
-        (f"  exit_liquidity : {'OK' if signal['exit_liquidity']['ok'] else 'THIN — ' + signal['exit_liquidity']['note']}"
-         if signal["exit_liquidity"]["checked"]
-         else f"  exit_liquidity : unknown ({signal['exit_liquidity']['note']})"),
+        *_connectivity_lines(server, config, candle_connector, candle_pair, len(fast),
+                             liq, funding_code, funding_detail),
+        *_exit_liquidity_lines(liq, config.total_amount_quote, config.exit_depth_band_pct),
         f"  regime slow    : {signal['slow_regime']} (ADX {signal['slow_adx']})",
         f"  regime fast    : {signal['fast_regime']} (ADX {signal['fast_adx']})",
         f"  components     : cfi {c['cfi']:+.3f} | vwap {c['vwap']:+.3f} | "
         f"trend {c['trend']:+.3f} | di {c['di']:+.3f} | funding {c['funding']:+.3f}",
         f"  natr           : {signal['natr_pct']:.3f}%  -> vol multiplier {signal['vol_multiplier']:.2f}x",
         f"  rsi            : {signal['rsi']:.1f}",
-        f"  funding_rate   : {signal['funding_rate']}",
+        funding_line,
     ]
 
-    if ladder:
-        lines.append("")
-        lines.append("READY-TO-SUBMIT dca_executor FIELDS (use these values verbatim):")
-        lines.append(json.dumps(ladder, indent=2))
-    else:
-        lines.append("")
+    lines.append("")
+    if signal["direction"] == "HOLD":
         lines.append("No ladder produced — the decision is HOLD.")
+    elif liq["state"] != "OK":
+        # The structural gate. A ladder is a submittable instruction, so it is
+        # withheld whenever the exit book is not verified deep enough to close
+        # what it would open — the failure that produced 21 entry fills against
+        # 3 closes. The decision itself is still reported, so nothing is hidden.
+        state = (f"UNVERIFIED ({liq['code']})" if liq["state"] == "UNVERIFIED"
+                 else "VERIFIED THIN")
+        lines.append(
+            f"No ladder emitted — decision was {signal['direction']} ({signal['score']:+.3f}) "
+            f"but exit_liquidity is {state}. A ladder is emitted only when the exit book is "
+            f"verified deep enough to close the position; entering here risks a position that "
+            f"cannot be exited."
+        )
+    elif ladder is None:
+        lines.append(f"No ladder emitted — {refusal}.")
+    else:
+        lines.append(
+            f"READY-TO-SUBMIT dca_executor FIELDS (use these values verbatim — sized to the "
+            f"{config.total_amount_quote:,.2f} quote budget at {config.leverage}x):"
+        )
+        lines.append(json.dumps(ladder, indent=2))
 
     return "\n".join(lines)
