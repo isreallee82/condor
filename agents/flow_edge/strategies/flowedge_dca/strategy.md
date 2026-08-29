@@ -1,21 +1,22 @@
 ---
 name: FlowEdge DCA
-description: Tick playbook — run the flow_edge_signal routine, gate its decision
-  against open executors and held positions, and open a volatility-scaled 3-level
-  maker DCA ladder when it clears.
+description: Tick playbook — run the flow_edge_signal routine, gate its decision against
+  open executors and held positions, and open a volatility-scaled 3-level maker DCA
+  ladder when it clears.
 agent_key: claude-code
 skills: []
 default_config:
   server_name: local
   frequency_sec: 60
-  total_amount_quote: 100
+  total_amount_quote: 70
   execution_mode: loop
   max_ticks: 0
   risk_limits:
     max_position_size_quote: 300
     max_open_executors: 4
     max_drawdown_pct: -8
-default_trading_context: Trade XRP-USD on hyperliquid_perpetual, 2x leverage, one-way mode.
+default_trading_context: Trade XRP-USD on hyperliquid_perpetual, 2x leverage, one-way
+  mode.
 created_by: 5775815348
 created_at: '2026-05-17T08:15:43.839293+00:00'
 ---

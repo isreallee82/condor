@@ -1,12 +1,12 @@
 ---
 name: FlowEdge
-description: Regime-adaptive directional trading agent for perpetuals. Reads a
-  volatility-normalised signal built from dual-timeframe ADX regime, candle flow,
-  VWAP extension and funding, then trades it through maker DCA ladders.
+description: Regime-adaptive directional trading agent for perpetuals. Reads a volatility-normalised
+  signal built from dual-timeframe ADX regime, candle flow, VWAP extension and funding,
+  then trades it through maker DCA ladders.
 agent_key: claude-code
 tools: []
-when_to_consult: Questions about directional entries on perpetuals, trend-regime
-  classification, volatility-scaled position sizing, or the state of the FlowEdge book.
+when_to_consult: Questions about directional entries on perpetuals, trend-regime classification,
+  volatility-scaled position sizing, or the state of the FlowEdge book.
 server_required: true
 server_name: local
 created_by: 5775815348
