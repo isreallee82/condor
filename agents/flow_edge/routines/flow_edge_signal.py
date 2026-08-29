@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from typing import Any
 
 import aiohttp
@@ -228,23 +229,40 @@ def _normalize_levels(raw: Any) -> list[list[float]]:
     market_making_expert/market_analyzer routine normalises the same shapes.
     Without this, a shape change raises out of the depth probe and gets reported
     with the same words as a network outage — a bug in us wearing an outage's
-    clothes. Anything unparseable still raises, and _probe_error labels it
-    MALFORMED_BOOK precisely so the two can never be confused again.
+    clothes. Two failures raise so _probe_error can label them MALFORMED_BOOK: a
+    non-numeric price inside a well-shaped level, and a level list in which NOT
+    ONE entry is a shape we recognise (a flat [price, price, ...] list, say).
+    Returning [] for the second used to render as EMPTY_BOOK — our own parsing
+    gap wearing a dead venue's clothes, the same confusion in the other
+    direction. A merely MIXED list still drops the entries it cannot read.
     """
     levels: list[list[float]] = []
+    seen = 0
+    unreadable = 0
+    first: Any = None
     for entry in raw or []:
+        seen += 1
+        if seen == 1:
+            first = entry
         if isinstance(entry, dict):
             price = entry.get("price", entry.get("p"))
             amount = entry.get("amount", entry.get("quantity", entry.get("size", entry.get("s"))))
         elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
             price, amount = entry[0], entry[1]
         else:
+            unreadable += 1
             continue
         if price is None or amount is None:
+            unreadable += 1
             continue
         price, amount = float(price), float(amount)
         if amount > 0:
             levels.append([price, amount])
+    if seen and unreadable == seen:
+        raise TypeError(
+            f"order-book levels in an unrecognised shape: {seen} entries, first is "
+            f"{type(first).__name__} {first!r:.60}"
+        )
     return levels
 
 
@@ -265,6 +283,13 @@ def _normalize_levels(raw: Any) -> list[list[float]]:
 
 def _probe_error(e: BaseException, cap: float = PROBE_TIMEOUT_SEC) -> tuple[str, str]:
     """Classify a probe failure as (code, human-readable detail).
+
+    `cap` is how long this particular call was allowed to run, and it is only
+    ever used to describe a timeout truthfully. Callers that do NOT wrap their
+    request in asyncio.wait_for must pass the time actually spent — the default
+    would otherwise report "no response within 10s" after a 60s client timeout,
+    a false statement about the evidence inside the one function whose job is to
+    make the evidence trustworthy.
 
     No code here ever means "OK". Every one of them means the observation could
     not be made, and for the exit-liquidity check an observation that could not
@@ -293,9 +318,15 @@ def _probe_error(e: BaseException, cap: float = PROBE_TIMEOUT_SEC) -> tuple[str,
             return "BAD_REQUEST", detail
         return "API_ERROR", detail
     if isinstance(e, TimeoutError):
-        # asyncio.TimeoutError is the builtin TimeoutError; str() is "".
+        # asyncio.TimeoutError is the builtin TimeoutError; str() is "" — which
+        # is why the CODE above is decided by type alone and never by str(e).
+        # aiohttp's read timeouts (SocketTimeoutError / ServerTimeoutError) land
+        # here too and DO carry a message ("Timeout on reading data from
+        # socket"); appending it is display only and throws no evidence away.
+        text = str(e)
         return "TRANSPORT_TIMEOUT", (
             f"{name}: no response within {cap:g}s — the request was accepted and never answered"
+            + (f" ({text})" if text else "")
         )
     if isinstance(e, (TypeError, ValueError, AttributeError, KeyError, IndexError)):
         # A defect in OUR parsing, not an outage. Kept distinct so a payload
@@ -315,7 +346,11 @@ def _server_label(client) -> str:
     the URL. A label is never worth breaking a tick over.
     """
     try:
-        for name, (cached, _verified_at) in getattr(get_config_manager(), "_clients", {}).items():
+        # ConfigManager._clients is private and its VALUE shape is not ours to
+        # depend on (it is a (client, verified_at) tuple today). Unpack
+        # defensively so a shape change costs a label, not a tick.
+        for name, entry in getattr(get_config_manager(), "_clients", {}).items():
+            cached = entry[0] if isinstance(entry, (tuple, list)) and entry else entry
             if cached is client:
                 return name
     except Exception:  # noqa: BLE001 — cosmetic only
@@ -582,7 +617,9 @@ async def _exit_liquidity(client, connector_name: str, trading_pair: str,
     `state` is one of:
       OK          — the book was read and can absorb `notional`
       THIN        — the book was read and cannot
-      UNVERIFIED  — the book could not be read at all; `code` says why
+      UNVERIFIED  — nothing was verified; `code` says why. Either the book could
+                    not be read (a `_probe_error` code), or it was read and there
+                    was no `notional` to judge it against (NOT_SIZED).
     UNVERIFIED is never OK. The failure that defaults to "ok" is the one that
     opens a position nobody can close. `mid` is kept because it is the only live
     price this routine ever sees from the execution venue, and it is what the
@@ -595,6 +632,20 @@ async def _exit_liquidity(client, connector_name: str, trading_pair: str,
             client.market_data.get_order_book(connector_name, trading_pair, depth=50),
             timeout=cap,
         )
+        # Some endpoints wrap the payload as {"data": {...}} — _to_frame already
+        # normalises that same envelope for candles. Unwrap it, then insist on a
+        # mapping that actually carries bids/asks: an unrecognised envelope fell
+        # through `.get("bids", [])` -> [] -> EMPTY_BOOK, i.e. a gap in our own
+        # parsing reported as a venue with no book.
+        if isinstance(ob, dict) and "bids" not in ob and "asks" not in ob:
+            inner = ob.get("data")
+            if isinstance(inner, dict):
+                ob = inner
+        if not isinstance(ob, dict) or ("bids" not in ob and "asks" not in ob):
+            raise TypeError(
+                f"order-book payload carries no bids/asks: {type(ob).__name__}"
+                + (f" keys={sorted(ob)[:8]}" if isinstance(ob, dict) else "")
+            )
         bids = _normalize_levels(ob.get("bids", []))
         asks = _normalize_levels(ob.get("asks", []))
         if not bids or not asks:
@@ -610,6 +661,19 @@ async def _exit_liquidity(client, connector_name: str, trading_pair: str,
         band = mid * band_pct / 100.0
         bid_q = sum(p * a for p, a in bids if p >= mid - band)
         ask_q = sum(p * a for p, a in asks if p <= mid + band)
+        if notional <= 0:
+            # No exit size was supplied (Config.total_amount_quote defaults to 0
+            # exactly so an un-forwarded budget is visible), so there is nothing
+            # to judge the book against. `min(bid_q, ask_q) >= 0` is trivially
+            # true, which rendered a one-lot book as "VERIFIED OK" — a fail-open
+            # on the single guard this probe exists to be, and the strongest
+            # possible green light handed out on zero evidence. The measurement
+            # is real and is kept (mid anchors the ladder); the VERDICT is not.
+            note = ("NOT_SIZED: the book was read, but total_amount_quote is 0 so there is no "
+                    "exit size to test it against — nothing about depth is verified")
+            out.update(checked=True, ok=False, mid=mid, bid_quote=bid_q, ask_quote=ask_q,
+                       state="UNVERIFIED", code="NOT_SIZED", detail=note, note=note)
+            return out
         ok = min(bid_q, ask_q) >= notional
         out.update(checked=True, ok=ok, mid=mid, bid_quote=bid_q, ask_quote=ask_q,
                    state="OK" if ok else "THIN", code="OK" if ok else "THIN")

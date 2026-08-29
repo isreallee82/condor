@@ -92,9 +92,15 @@ that opened 21 fills and closed 3.
 always fills politely. The exit is a market order, and a venue rejects it outright
 when there is no liquidity inside its price band — 53 of ~56 closes were refused,
 so positions opened that could not be closed. The routine reports
-`exit_liquidity` every tick for exactly this reason: `OK` or `THIN` is a measurement
-of the book, while `UNVERIFIED` means the probe never returned — a fact about the
-connection to the API, not about the venue. A position you cannot exit is worse than
+`exit_liquidity` every tick for exactly this reason: `VERIFIED OK` and
+`VERIFIED THIN` are measurements of the book, while `UNVERIFIED (<CODE>)` means the
+book was never read at all. `UNVERIFIED` never means "probably fine", and it has no
+single cause — `<CODE>` carries it: `BACKEND_UNREACHABLE`, `VENUE_UNREACHABLE`,
+`TRANSPORT_TIMEOUT` and `API_ERROR` are facts about the connection rather than the
+venue; `EMPTY_BOOK` is the venue answering with no bids or asks, which is a fact
+about the venue and the pair; `BAD_REQUEST` is the API rejecting the connector, pair
+or endpoint we asked for; `MALFORMED_BOOK` is a defect in our own parser. Read the
+code before drawing any conclusion. A position you cannot exit is worse than
 no position, and it is the entry decision that creates it.
 
 **Judge yourself on trades that happened.** An executor that expires having filled
@@ -124,3 +130,6 @@ These hold regardless of which playbook you are running.
 - A held position is yours until you close it. Managing it outranks any new entry.
 - Never open a ladder the book cannot absorb on the way out, and never one whose
   exit book you could not measure at all — see `exit_liquidity`.
+- Never submit, improvise or reconstruct a ladder the routine did not emit. When
+  there is no `READY-TO-SUBMIT` block there is no entry this tick, whatever the
+  reason it was withheld and however good the signal looks.
