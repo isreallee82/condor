@@ -275,7 +275,17 @@ def test_winddown_no_client_alerts_loudly(tmp_path, monkeypatch):
 
     engine._get_client = _no_client
     asyncio.run(run_shutdown(engine, "breach"))
-    assert any("🚨" in n and "could NOT reach the API" in n for n in notes)
+    # The headline must stay loud and must flag open positions, but it must NOT
+    # claim the API was unreachable: _get_client reports every failure as a bare
+    # None, so a 401, a 500, or a hung server that answered the connect all land
+    # here too. It may only say the client could not be ACQUIRED.
+    assert any(
+        "🚨" in n
+        and "could NOT acquire an API client" in n
+        and "positions may be OPEN" in n
+        for n in notes
+    )
+    assert not any("could NOT reach the API" in n for n in notes)
 
 
 # ── engine wrapper idempotency ──

@@ -1456,6 +1456,79 @@ async def start_strategy(
     return await _start(_get_agent(slug), _get_strategy(slug, sslug), req, user.id)
 
 
+def reconcile_trading_context(
+    config: dict[str, Any], trading_context: str, *, explicit: bool
+) -> tuple[str, str]:
+    """Reconcile a free-text ``trading_context`` against the typed config.
+
+    ``connector_name`` / ``trading_pair`` are what the engine, the credentials
+    and the PnL attribution are keyed to; the context is prose. When the two name
+    different venues the session config contradicts itself, and the agent — which
+    sees both — picks (session_6 decided the typed config was "misconfigured" and
+    from tick #8 computed entries for the venue named in the prose).
+
+    Returns ``(context_to_persist, warning)``. The typed config always wins; what
+    differs is what happens to the prose. A context that arrived by fallback (this
+    launch passed none, so ``_start`` filled in the strategy's
+    ``default_trading_context``) was not asked for by anyone here, so the stale
+    text is dropped — ``""`` — rather than persisted. A context the caller passed
+    explicitly is KEPT and only flagged: naming a second venue is routinely
+    legitimate ("hedge on binance_perpetual", "compare okx_perpetual depth before
+    entering"), and a regex match on prose must never refuse a launch — the
+    prompt's precedence rule and its [CONFIG CONFLICT] block already tell the
+    agent which values to trade. Either way the warning is logged loudly and
+    returned, so the launcher can surface it to whoever started the session.
+
+    The text is NOT rewritten to name the typed venue: that would forge an
+    operator instruction to trade a venue nobody chose in prose.
+
+    Nothing outside ``_start`` has to call this: every launch path reaches
+    ``_start``, the MCP/Telegram one included — it POSTs to the same
+    ``/agents/{slug}/strategies/{sslug}/start`` endpoint. Note that path lifts a
+    stored ``config.yml`` context out of the config and forwards it as
+    ``trading_context``, so a stored context counts as explicit there and is
+    flagged rather than dropped.
+    """
+    from condor.agents.prompts import detect_venue_conflicts
+
+    try:
+        found = detect_venue_conflicts(config, trading_context)
+    except Exception:  # a context is free text — never fail a launch on a parse
+        log.debug("trading_context reconciliation skipped", exc_info=True)
+        return trading_context, ""
+    # Only the venue fields are acted on here. A leverage number in prose is not
+    # worth dropping a whole context over; the prompt's CURRENT CONFIG precedence
+    # rule and its [CONFIG CONFLICT] line cover that case.
+    conflicts = {
+        k: v for k, v in found.items() if k in ("connector_name", "trading_pair")
+    }
+    if not conflicts:
+        return trading_context, ""
+
+    named = ", ".join(f"{k}={ctx}" for k, (ctx, _) in conflicts.items())
+    active = ", ".join(f"{k}={cfg}" for k, (_, cfg) in conflicts.items())
+    if explicit:
+        # Flag, never refuse. The launch was asked for with this text, the prose may
+        # legitimately name a second venue (a hedge, a reference book), and the
+        # detector reads free text — a false positive here would cost a valid
+        # session, which is a worse outcome than a flagged one.
+        msg = (
+            f"trading_context names {named} but this session is configured for "
+            f"{active}, which wins: the engine, the credentials and the PnL "
+            "attribution follow the typed config, and the agent is told so every "
+            "tick. Reword the context or fix the config if that is not what you meant."
+        )
+        log.warning("%s", msg)
+        return trading_context, msg
+    msg = (
+        f"Dropped the default trading_context naming {named}: it contradicts the "
+        f"configured {active}, which wins. Pass an explicit trading_context if the "
+        "text is the value you meant."
+    )
+    log.warning("%s", msg)
+    return "", msg
+
+
 async def _start(agent, strategy, req: StartStrategyRequest, user_id: int) -> dict:
     """Spawn a TickEngine session for ``strategy`` under ``agent``."""
     from condor.agents.config import load_full_config
@@ -1470,6 +1543,20 @@ async def _start(agent, strategy, req: StartStrategyRequest, user_id: int) -> di
     elif not config_dict.get("trading_context") and strategy.default_trading_context:
         config_dict["trading_context"] = strategy.default_trading_context
 
+    # Reconcile prose against typed config BEFORE the engine persists the merged
+    # dict (TickEngine.__init__ -> save_full_config), so a stale strategy default
+    # naming another venue is never stamped into a new session. A context this
+    # caller passed itself is kept and only flagged — see the helper.
+    context, context_warning = reconcile_trading_context(
+        config_dict,
+        config_dict.get("trading_context", ""),
+        explicit=bool(req.trading_context),
+    )
+    if context_warning:
+        # Assign rather than pop a dropped context: AgentConfig declares
+        # trading_context, so every session config.yml on disk carries the key.
+        config_dict["trading_context"] = context
+
     # Web callers always act as themselves (mirror consult): honoring
     # ``req.user_id`` would let any authenticated session start the engine
     # under another user's memory scope and accessible-servers fallback.
@@ -1481,12 +1568,18 @@ async def _start(agent, strategy, req: StartStrategyRequest, user_id: int) -> di
         user_id=user_id,
     )
     await new_engine.start()
-    return {
+    resp: dict[str, Any] = {
         "started": True,
         "strategy": strategy.slug,
         "agent_id": new_engine.agent_id,
         "session_num": new_engine.session_num,
     }
+    # Surface the context warning to whoever launched (web dialog, Telegram/MCP,
+    # which returns this JSON verbatim): the session started, but its context
+    # either was dropped or names a venue it will not trade.
+    if context_warning:
+        resp["warnings"] = [context_warning]
+    return resp
 
 
 @router.post("/{slug}/strategies/{sslug}/stop")

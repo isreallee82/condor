@@ -16,6 +16,77 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# The one negative value that means "no drawdown limit" rather than a magnitude.
+DRAWDOWN_DISABLED = -1.0
+
+
+def _normalize_drawdown_limit(name: str, value: Any) -> Any:
+    """Read a negatively-spelled drawdown limit as its magnitude.
+
+    Configs are routinely written as ``max_drawdown_pct: -8`` -- the natural way
+    to say "pause me at 8% down" -- but the checks in ``get_state`` compare
+    against a positive magnitude and treat anything below zero as the documented
+    ``-1`` disabled sentinel. That spelling therefore switched the soft pause
+    silently OFF while the playbook still told the agent a limit was in force.
+    Any negative other than the sentinel is read as the magnitude its author
+    meant, and the coercion is logged so it is visible rather than invisible.
+
+    Applied ONLY to ``max_drawdown_pct`` -- see ``RiskLimits.__post_init__``.
+    """
+    # Non-numeric config is left untouched: it should fail where it always did
+    # (at the comparison), not turn construction into the error site.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if value >= 0 or float(value) == DRAWDOWN_DISABLED:
+        return value
+    coerced = abs(float(value))
+    log.warning(
+        "Risk limit %s=%s read as %.1f%%: a negative magnitude enables the "
+        "limit at its absolute value (only -1 disables it)",
+        name,
+        value,
+        coerced,
+    )
+    return coerced
+
+
+# Config keys that can carry the quote notional of an executor create, in no
+# particular order -- the gate reads every one that is present (see
+# ``_executor_notional``).
+_NOTIONAL_KEYS = ("total_amount_quote", "amounts_quote", "amount")
+
+
+def _executor_notional(config: dict) -> tuple[float, str]:
+    """Quote notional an executor create would put at risk.
+
+    A ``dca_executor`` config carries no ``total_amount_quote`` at all: its size
+    lives in ``amounts_quote``, a LIST with one entry per ladder level (see
+    ``_build_ladder`` in agents/flow_edge/routines/flow_edge_signal.py). Reading
+    only the scalar keys therefore measured every DCA create as $0 and the
+    position-size gate never bound, whatever the ladder's notional. Lists are
+    summed; the largest reading across the keys present wins, so a config whose
+    ``amounts_quote`` sums past its own declared ``total_amount_quote`` is
+    gated on what it actually deploys.
+
+    Returns ``(notional, problem)``. ``problem`` is non-empty when a size field
+    is present but unreadable -- the caller blocks in that case rather than
+    approving an unmeasurable create against a 0.
+    """
+    notional = 0.0
+    for key in _NOTIONAL_KEYS:
+        raw = config.get(key)
+        if raw is None:
+            continue
+        levels = raw if isinstance(raw, (list, tuple)) else [raw]
+        total = 0.0
+        for level in levels:
+            try:
+                total += float(level)
+            except (TypeError, ValueError):
+                return 0.0, f"{key}={raw!r} is not a readable amount"
+        notional = max(notional, total)
+    return notional, ""
+
 
 @dataclass
 class RiskLimits:
@@ -25,6 +96,30 @@ class RiskLimits:
     # Hard kill-switch: a deeper drawdown than the soft ``max_drawdown_pct`` pause;
     # breaching it winds down positions (see condor.agents.shutdown). -1 = disabled.
     shutdown_drawdown_pct: float = -1.0
+
+    def __post_init__(self) -> None:
+        # Normalise at construction rather than at the comparison so the value
+        # RiskState.to_dict exports -- and which the prompt's [RISK STATE] block
+        # and the journal snapshots render as "Drawdown: ..." -- is already the
+        # limit actually being enforced, instead of reading "disabled".
+        #
+        # Deliberately NOT applied to shutdown_drawdown_pct. The two fields are
+        # different classes of action, so re-reading a negative differently is
+        # only safe for one of them:
+        #   * max_drawdown_pct only pauses ticks. Reading -8 as 8 can at worst
+        #     stop an agent trading; nothing is placed or closed as a result,
+        #     and every shipped session writes it as a negative magnitude.
+        #   * shutdown_drawdown_pct arms an emergency winddown that CLOSES
+        #     positions (condor.agents.shutdown). Coercing it would re-arm a
+        #     hard kill switch on configs whose author wrote a negative to mean
+        #     "off" -- which is exactly what condor/agents/config.py ("-1 =
+        #     disabled") and the frontend's AgentControls invite. Turning a
+        #     position-closing action back ON by reinterpreting existing config
+        #     is not a change this normalisation is entitled to make, so any
+        #     negative here keeps its documented meaning: disabled.
+        self.max_drawdown_pct = _normalize_drawdown_limit(
+            "max_drawdown_pct", self.max_drawdown_pct
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> RiskLimits:
@@ -150,11 +245,15 @@ class RiskEngine:
                 f"Max open executors ({self.limits.max_open_executors}) reached",
             )
 
-        # Check position size
+        # Check position size. Reads scalar *and* list-valued size keys, so a
+        # dca_executor ladder (amounts_quote: [...]) is measured instead of
+        # silently sizing to 0.
         config = input_data.get("executor_config", {})
-        amount = float(
-            config.get("total_amount_quote", 0) or config.get("amount", 0) or 0
-        )
+        amount, problem = _executor_notional(config)
+        if problem:
+            # Fail closed: an unmeasurable create cannot be gated, and letting
+            # it through would be gating it against a fabricated $0.
+            return False, f"Cannot size executor create: {problem}"
 
         if current_state.total_exposure + amount > self.limits.max_position_size_quote:
             return False, (

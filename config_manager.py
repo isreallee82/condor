@@ -10,11 +10,79 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import yaml
 from aiohttp import ClientTimeout
 
 logger = logging.getLogger(__name__)
+
+
+def _build_base_url(host: str, port: int) -> str:
+    """Build the API base URL for a configured server.
+
+    `host` is meant to be a bare hostname ("localhost"), but a full URL pasted
+    into the Host field is common enough to handle: prefixing "http://" blindly
+    turns "https://example.com" into "http://https://example.com:443", which
+    aiohttp reads as host "https" on port 80. A scheme already in `host` wins;
+    otherwise port 443 implies TLS.
+    """
+    host = host.strip().rstrip("/")
+    parsed = urlparse(host if "://" in host else f"//{host}")
+    scheme = parsed.scheme or ("https" if str(port) == "443" else "http")
+    return f"{scheme}://{parsed.hostname or host}:{port}"
+
+
+class ClientAcquisitionError(ConnectionError):
+    """The last attempt to acquire an API client failed and is still cached.
+
+    Subclasses ``ConnectionError`` so every existing ``except`` keeps working,
+    but carries a name that asserts nothing about *why*: the cached failure may
+    be a refused connect, a timeout that proves nothing, or an HTTP error from a
+    server that answered perfectly well. The class name is user-visible -- the
+    routine layer renders uncaught exceptions as ``Error: <ClassName>: <msg>``
+    straight into the agent's context -- so it must not name a cause the code
+    has not established.
+    """
+
+
+# What each class of acquisition failure actually establishes. The fail-fast
+# branch quotes these verbatim, and they reach the agent, so each says only what
+# the exception itself proves.
+#
+# "connect" deliberately does NOT name a layer. It is reached from
+# ClientConnectionError/OSError, which covers DNS failures (no TCP connect was
+# ever attempted), TLS failures (the TCP connect SUCCEEDED and the handshake
+# did not), and a server that ACCEPTED the connection and then dropped it --
+# ServerDisconnectedError, which is what a restarting API container looks like.
+# Naming the TCP connect would assert the opposite of what half of them prove.
+_FAILURE_HEADLINE = {
+    "connect": (
+        "could not be reached over the network -- the connection attempt failed; "
+        "whether that was DNS, the TCP connect, TLS, or the server dropping a "
+        "connection it had accepted is NOT established"
+    ),
+    "timeout": (
+        "did not respond in time -- whether it is reachable is NOT established "
+        "(the connect may have succeeded and the request then hung)"
+    ),
+    "http": (
+        "answered but returned an HTTP error -- it IS reachable; this is not a "
+        "connectivity fault"
+    ),
+    "auth": (
+        "answered but rejected the credentials -- it IS reachable; the fault is "
+        "authentication, not connectivity"
+    ),
+    "cancelled": (
+        "was not reached before the attempt was cancelled -- our own deadline "
+        "expired first, so NOTHING about the server was established"
+    ),
+    "unknown": (
+        "could not be used, for a reason this error does NOT establish -- do "
+        "not infer a network, venue or credential fault from it"
+    ),
+}
 
 
 class UserRole(str, Enum):
@@ -64,6 +132,24 @@ class ConfigManager:
         self._client_locks: Dict[str, asyncio.Lock] = (
             {}
         )  # per-server lock for get_client
+        # Negative cache for the create path. Client creation happens under the
+        # per-server lock, so without this every queued waiter (each TickEngine,
+        # each routine run, each dashboard poll) pays its own full-cost connect
+        # attempt, serially, against a server already known to be down.
+        # Timestamps are time.monotonic(), not time.time(): a backward wall-clock
+        # step would make the age negative and keep an entry inside the fail-fast
+        # window past its TTL. (_clients above stays on time.time(); the two sets
+        # of timestamps are never compared with each other.)
+        # Emergency callers bypass this entirely -- see get_client(force=True)
+        # and clear_client_failures().
+        # The `kind` is decided from the exception TYPE at record time (see
+        # _classify_client_failure) so the fail-fast branch can say what the
+        # failure actually was instead of asserting "unreachable" for every
+        # cause. Auth rejections are deliberately never recorded here.
+        self._client_failures: Dict[str, Tuple[float, str, str]] = (
+            {}
+        )  # server_name -> (failed_at_monotonic, reason, kind)
+        self._client_failure_ttl = 20  # seconds to fail fast after a failed connect
         self._load_config()
         self._load_audit_log()
 
@@ -278,6 +364,9 @@ class ConfigManager:
         # Clear cached client
         if name in self._clients:
             del self._clients[name]
+        # ...and any negative-cache entry: a re-pointed or re-credentialed
+        # server deserves an immediate retry, not the fail-fast window.
+        self._client_failures.pop(name, None)
 
         if host is not None:
             servers[name]["host"] = host
@@ -302,6 +391,7 @@ class ConfigManager:
         # Clear cached client
         if name in self._clients:
             del self._clients[name]
+        self._client_failures.pop(name, None)
 
         del servers[name]
 
@@ -348,8 +438,18 @@ class ConfigManager:
         )
         return secret
 
-    async def get_client(self, name: str = None):
-        """Get or create API client for a server."""
+    async def get_client(self, name: str = None, force: bool = False):
+        """Get or create API client for a server.
+
+        ``force=True`` ignores the negative cache and pays for a real connect
+        attempt. It exists for emergency paths -- the agent kill switch in
+        condor.agents.shutdown, which closes open positions -- where being
+        told "unreachable" by an entry some unrelated tick, routine run or
+        dashboard poll left behind seconds ago means the winddown aborts with
+        positions still open, having never touched the network. Ordinary
+        callers must keep the default so a down server still fails fast
+        instead of queueing every caller behind its own connect budget.
+        """
         from hummingbot_api_client import HummingbotAPIClient
 
         if name is None:
@@ -375,10 +475,17 @@ class ConfigManager:
             self._client_locks[name] = asyncio.Lock()
 
         async with self._client_locks[name]:
-            return await self._get_or_create_client(name, HummingbotAPIClient)
+            return await self._get_or_create_client(
+                name, HummingbotAPIClient, force=force
+            )
 
-    async def _get_or_create_client(self, name: str, HummingbotAPIClient):
-        """Inner client acquisition — must be called under _client_locks[name]."""
+    async def _get_or_create_client(
+        self, name: str, HummingbotAPIClient, force: bool = False
+    ):
+        """Inner client acquisition — must be called under _client_locks[name].
+
+        ``force`` bypasses the negative cache only; see ``get_client``.
+        """
         # Re-check under lock (another coroutine may have just created it)
         if name in self._clients:
             client, last_verified = self._clients[name]
@@ -407,9 +514,44 @@ class ConfigManager:
                     pass
                 del self._clients[name]
 
+        # Fail fast while a recent connect failure is still fresh. Creation runs
+        # under _client_locks[name], so refusing here keeps a queue of waiters
+        # from each re-paying the connect budget one after another.
+        failure = self._client_failures.get(name)
+        if failure:
+            failed_at, reason, kind = failure
+            age = time.monotonic() - failed_at
+            if force:
+                # An emergency caller is never starved by an entry somebody
+                # else's poll left behind: drop it and connect for real.
+                logger.warning(
+                    f"Forcing a connect to '{name}' despite a failure "
+                    f"{age:.0f}s ago [{kind}]: {reason}"
+                )
+                del self._client_failures[name]
+            elif age < self._client_failure_ttl:
+                # Report the cached failure for what it was. The old wording
+                # said "unreachable (connect failed ...)" for every cause,
+                # including a server that answered; this text propagates
+                # uncaught to the agent, so a cause nobody measured must never
+                # be asserted in it. It also states plainly that NO attempt was
+                # made just now -- the caller is seeing a cached verdict, not a
+                # fresh measurement.
+                headline = _FAILURE_HEADLINE.get(
+                    kind, _FAILURE_HEADLINE["unknown"]
+                )
+                raise ClientAcquisitionError(
+                    f"Server '{name}' {headline}. "
+                    f"Last acquisition attempt failed {age:.0f}s ago and is still "
+                    f"inside the {self._client_failure_ttl}s fail-fast window, so "
+                    f"no new attempt was made just now: {reason}"
+                )
+            else:
+                del self._client_failures[name]
+
         # Create new client
         server = self._data["servers"][name]
-        base_url = f"http://{server['host']}:{server['port']}"
+        base_url = _build_base_url(server["host"], server["port"])
         client = HummingbotAPIClient(
             base_url=base_url,
             username=server["username"],
@@ -418,15 +560,133 @@ class ConfigManager:
         )
 
         try:
+            # init() only builds the aiohttp session and the router objects --
+            # it issues no request, so it needs no cap. The liveness call does,
+            # and it is the one await that can hold the per-server lock: cap it
+            # rather than letting the client's 60s *total* timeout stall every
+            # other caller queued on this server. 12s, deliberately just past
+            # the client's own connect=10, so a stalled TCP/TLS connect trips
+            # the connector first and raises its informative ClientConnectorError
+            # ("Cannot connect to host ...") instead of this bare TimeoutError.
+            # Worst case this function holds the lock for ~17s: 5s for the
+            # stale-connection liveness check above, then 12s here.
             await client.init()
-            await client.accounts.list_accounts()
+            await asyncio.wait_for(client.accounts.list_accounts(), timeout=12)
             self._clients[name] = (client, time.time())
+            self._client_failures.pop(name, None)
             logger.info(f"Connected to server '{name}' at {base_url}")
             return client
-        except Exception as e:
-            await client.close()
-            logger.error(f"Failed to connect to '{name}': {e}")
+        except BaseException as e:
+            # BaseException, not Exception: TickEngine._tick acquires the client
+            # inside `async with asyncio.timeout(_SETUP_BUDGET_SEC)`, so a budget
+            # expiry lands here as asyncio.CancelledError, which is NOT an
+            # Exception. Catching only Exception skipped this whole handler --
+            # the aiohttp session leaked AND nothing was recorded, so the next
+            # caller paid the full budget over again: precisely the queue-of-
+            # waiters case the negative cache exists to prevent. Everything
+            # below is re-raised unchanged, KeyboardInterrupt included.
+            #
+            # Record and log BEFORE closing: a close() that raises would
+            # otherwise replace `e` and skip both the negative-cache write and
+            # the log line, leaving the failure invisible and uncached.
+            kind, reason = self._classify_client_failure(e)
+            if kind == "auth":
+                # An auth rejection does not belong in the negative cache. The
+                # cache exists so a queue of waiters does not each pay a full
+                # connect budget against a server that will not answer; a 401
+                # comes back immediately and costs nothing to re-learn. Caching
+                # it would tell every caller for the next 20s something untrue
+                # about the server, and would keep refusing for 20s after the
+                # credentials are fixed. The real ClientResponseError is
+                # re-raised instead, so callers see the actual 401.
+                logger.error(
+                    f"Server '{name}' rejected our credentials: {reason} "
+                    f"(not negatively cached -- the server is reachable)"
+                )
+            else:
+                self._client_failures[name] = (time.monotonic(), reason, kind)
+                logger.error(
+                    f"Failed to acquire a client for '{name}' [{kind}]: {reason}"
+                )
+            try:
+                await client.close()
+            except BaseException:
+                # Swallow anything close() raises (including a CancelledError
+                # re-delivered while unwinding) so it cannot mask `e`, which is
+                # re-raised immediately below.
+                logger.debug(f"Error closing client for '{name}'", exc_info=True)
             raise
+
+    @staticmethod
+    def _classify_client_failure(e: BaseException) -> Tuple[str, str]:
+        """Classify a failed client acquisition, returning ``(kind, reason)``.
+
+        Classification is by exception TYPE, never by message text: a hung
+        request raises a bare ``asyncio.TimeoutError`` whose ``str()`` is
+        EMPTY, so any taxonomy built on ``str(e)`` silently falls through to
+        its default for exactly the case it most needs to name.
+
+        Kinds (see ``_FAILURE_HEADLINE`` for what each one is allowed to claim):
+          ``connect``  the TCP/TLS connect itself failed -- the server really is
+                       unreachable at that address.
+          ``auth``     the server answered and rejected the credentials (401/403).
+                       It IS reachable; the fault is credentials.
+          ``http``     the server answered with some other error status. It IS
+                       reachable; the fault is server-side or in the request.
+          ``timeout``  nothing came back in time. Reachability is NOT
+                       established: the connect may have succeeded and the
+                       request then hung.
+          ``cancelled`` our own caller's deadline expired mid-attempt
+                       (TickEngine's setup budget). Says nothing about the
+                       server at all.
+          ``unknown``  anything else. The cause is NOT established -- say so
+                       rather than guessing one.
+
+        ``reason`` is display text only; nothing branches on it. The class name
+        is always included because a bare ``asyncio.TimeoutError`` stringifies
+        to "", which would leave the log line and the cached reason ending at a
+        colon.
+        """
+        import aiohttp
+
+        reason = f"{type(e).__name__}({e})"
+        if isinstance(e, aiohttp.ClientResponseError):
+            # The server answered. Whatever went wrong, it was not the network.
+            return ("auth" if e.status in (401, 403) else "http"), reason
+        # TimeoutError must be tested before OSError: since Python 3.3 the
+        # builtin TimeoutError IS an OSError subclass (and since 3.11
+        # asyncio.TimeoutError is an alias of it), and aiohttp's
+        # ServerTimeoutError is both a TimeoutError and a ClientConnectionError.
+        # Ordering it first keeps "nothing came back" from being reported as a
+        # proven connect failure.
+        if isinstance(e, asyncio.CancelledError):
+            # Our caller gave up; the server never got a verdict. Kept distinct
+            # from "timeout" so the cached text cannot imply the server was slow
+            # when it may never have been asked.
+            return "cancelled", reason
+        if isinstance(e, asyncio.TimeoutError):
+            return "timeout", reason
+        if isinstance(e, (aiohttp.ClientConnectionError, OSError)):
+            return "connect", reason
+        return "unknown", reason
+
+    def clear_client_failures(self, name: Optional[str] = None) -> None:
+        """Drop cached acquisition failures so the next call connects for real.
+
+        ``name=None`` clears every server. This is the emergency-path escape
+        hatch for a caller that cannot name its server in advance: the
+        ``get_bots_client`` fallback in
+        ``condor.agents.engine.TickEngine._get_client`` resolves the server
+        itself and calls ``get_client()`` without ``force``, so without this a
+        winddown could still be refused in 0.000s by an entry an unrelated tick
+        or dashboard poll left behind. Ordinary callers must NOT use it -- the
+        cache is what keeps a queue of waiters from each paying its own connect
+        budget against a server already known to be down.
+        """
+        if name is None:
+            self._client_failures.clear()
+        else:
+            self._client_failures.pop(name, None)
 
     async def get_client_for_chat(
         self, chat_id: int, user_id: int = None, preferred_server: str = None
@@ -472,7 +732,7 @@ class ConfigManager:
             return {"status": "error", "message": "Server not found"}
 
         server = self._data["servers"][name]
-        base_url = f"http://{server['host']}:{server['port']}"
+        base_url = _build_base_url(server["host"], server["port"])
 
         client = HummingbotAPIClient(
             base_url=base_url,
@@ -484,17 +744,44 @@ class ConfigManager:
         try:
             await client.init()
             await client.accounts.list_accounts()
+            # A server independently verified as reachable must not keep
+            # fast-failing get_client() for the rest of the negative-cache
+            # window: the dashboard would read "online" while every acquisition
+            # raised ConnectionError. This is also the only operator-facing way
+            # to clear the window short of modify_server.
+            self._client_failures.pop(name, None)
             return {"status": "online", "message": "Connected and authenticated"}
         except Exception as e:
-            error_msg = str(e)
-            if "401" in error_msg:
+            # The reverse is deliberately not done: this probe runs on a much
+            # tighter 3s/2s budget than get_client's, so a failure here does not
+            # prove get_client would fail and must not poison its cache.
+            #
+            # Classified by exception type, sharing get_client's classifier. The
+            # previous substring taxonomy over str(e) mis-handled its most
+            # important case: this probe uses ClientTimeout(total=3, connect=2),
+            # and a hung server raises a bare asyncio.TimeoutError whose str()
+            # is EMPTY -- matching none of "401"/"timeout"/"connect" and
+            # rendering to the operator as "Error: " with nothing after it.
+            kind, reason = self._classify_client_failure(e)
+            if kind == "auth":
                 return {"status": "auth_error", "message": "Invalid credentials"}
-            elif "timeout" in error_msg.lower():
-                return {"status": "offline", "message": "Connection timeout"}
-            elif "connect" in error_msg.lower():
+            elif kind == "connect":
                 return {"status": "offline", "message": "Cannot reach server"}
+            elif kind == "timeout":
+                # "offline" is the closest of the four statuses this dashboard
+                # understands, but the message must not claim more than a
+                # timeout proves.
+                return {
+                    "status": "offline",
+                    "message": "No response within 3s (unreachable or too slow)",
+                }
+            elif kind == "http":
+                return {
+                    "status": "error",
+                    "message": f"Server answered with an error: {reason[:80]}",
+                }
             else:
-                return {"status": "error", "message": f"Error: {error_msg[:80]}"}
+                return {"status": "error", "message": f"Error: {reason[:80]}"}
         finally:
             try:
                 await client.close()
@@ -510,6 +797,11 @@ class ConfigManager:
             except Exception as e:
                 logger.error(f"Error closing client '{name}': {e}")
         self._clients.clear()
+        # Drop the negative cache too. It is keyed on wall-independent monotonic
+        # time and survives this teardown otherwise, so a shutdown-then-reuse of
+        # the same ConfigManager instance would carry stale poison into the new
+        # life of the process for up to _client_failure_ttl seconds.
+        self._client_failures.clear()
 
     # =========================================================================
     # USER MANAGEMENT

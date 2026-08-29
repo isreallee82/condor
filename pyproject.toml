@@ -19,6 +19,8 @@ dependencies = [
     "uvicorn[standard]",
     "python-jose[cryptography]",
     "faster-whisper",
+    # onnxruntime ships no Intel-macOS wheel from 1.24 on; last one that does is 1.23.x.
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "matplotlib>=3.10.8",
     "scipy>=1.17.1",
     "pydantic-ai[mcp]",

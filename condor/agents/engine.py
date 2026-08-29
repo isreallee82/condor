@@ -38,6 +38,45 @@ from .strategy import Strategy
 
 log = logging.getLogger(__name__)
 
+# Wall-clock budgets for the parts of a tick that are pure plumbing, and the
+# floor on the gap between two ticks. These are safety limits, not tuning knobs,
+# so they live here as constants rather than in AgentConfig — a per-agent
+# override (especially for the setup budget) would be a reasonable follow-up
+# once there is a reason to vary it.
+#
+# _SETUP_BUDGET_SEC covers everything before the LLM turn: client acquisition,
+# bot adoption, core providers. 45s is far above a healthy setup (a few seconds)
+# and below the API client's own 60s per-call timeout — a call still pending at
+# 45s is going to time out anyway, so waiting out the rest buys nothing.
+_SETUP_BUDGET_SEC = 45.0
+# Spawning the agent subprocess + ACP handshake (initialize, session/new,
+# set_model). Every one of those is an unbounded await on the bridge answering.
+_CLIENT_START_BUDGET_SEC = 60.0
+# How long we WAIT for a per-tick client teardown — not how long teardown gets.
+# See _reap_client: the reap itself is never cancelled.
+_CLIENT_STOP_WAIT_SEC = 30.0
+# Minimum gap after a tick that OVERRAN frequency_sec: such a tick usually
+# overran because the backend is degraded, and the last thing a degraded backend
+# needs is a gapless retry loop. It is capped at frequency_sec itself, and a
+# tick that kept up is not subject to it at all -- see _loop.
+_MIN_TICK_GAP_SEC = 10.0
+
+
+# Config keys the platform genuinely consumes without declaring them as
+# AgentConfig fields: the venue triple that build_tick_prompt renders and
+# detect_venue_conflicts reconciles against the session context, the pydantic-ai
+# tool filter read in _create_client, and the boot-restart flag read by
+# condor.runtime.loops.
+_PLATFORM_CONFIG_KEYS = frozenset(
+    {
+        "connector_name",
+        "trading_pair",
+        "leverage",
+        "tool_filter_mode",
+        "restart_on_boot",
+    }
+)
+
 # The running-engine registry lives in the supervisor (condor.runtime.loops),
 # which is the single place that mutates it and records each transition to
 # disk. These stay as thin delegations for existing callers.
@@ -109,6 +148,13 @@ class TickEngine:
     _pending_directives: list[str] = field(default_factory=list, init=False)
     _cached_routines_section: str | None = field(default=None, init=False, repr=False)
     _adoption_done: bool = field(default=False, init=False, repr=False)
+    # One journal note per run when the tick can't keep up with frequency_sec —
+    # the log warns on every overrun, but the Decisions section is read back into
+    # the prompt, so it must not fill up with scheduling noise.
+    _overrun_journalled: bool = field(default=False, init=False, repr=False)
+    # Detached teardown tasks (see _reap_client). Held only so the event loop
+    # keeps a strong reference and can't garbage-collect a reap mid-kill.
+    _reaping: set = field(default_factory=set, init=False, repr=False)
     # The live per-tick ACP client, held so stop() can reap it if the tick's own
     # finally is skipped (e.g. cancelled mid-await). None between ticks.
     _active_client: "ACPClient | PydanticAIClient | None" = field(
@@ -141,6 +187,8 @@ class TickEngine:
         self.config["bot_name"] = resolve_bot_name(
             self.config, self.agent.slug, self.strategy.slug
         )
+
+        self._warn_unknown_config_keys()
 
         if self.is_experiment:
             self.session_num = next_experiment_number(strategy_dir)
@@ -188,6 +236,56 @@ class TickEngine:
         from condor.runtime.state import BoundState, namespace_for
 
         self.state = BoundState(namespace_for(self))
+
+    def _warn_unknown_config_keys(self) -> None:
+        """Log config keys this session renders to the model but nothing declares.
+
+        ``build_tick_prompt`` prints every non-excluded config key under
+        "[CURRENT CONFIG] ... These are the ACTIVE values for this session", so a
+        typo or a stale key is presented to the agent as a live knob.
+        ``tick_interval: 60`` rode into several sessions exactly that way — it
+        appears nowhere in the codebase, yet the model was told it was active
+        (while the knob that really schedules ticks, ``frequency_sec``, is
+        excluded from that block).
+
+        A key counts as declared when it is an ``AgentConfig`` field, an entry of
+        the strategy's ``default_config``, or one of ``_PLATFORM_CONFIG_KEYS``
+        (read by platform code that never declares them).
+
+        ``default_config`` is what keeps this honest for a key whose only
+        consumer is the *model*. The FlowEdge DCA playbook's Step 1 tells the
+        model to forward ``candle_connector`` / ``candle_trading_pair`` into the
+        signal routine's own config, and the routine reads them there — a link
+        no typed declaration in this process can see. Both are declared in that
+        strategy's ``default_config``, which is exactly where such a key belongs
+        (it is also what gives the key a value when a session omits it), so they
+        are not flagged and need no special case here. That matters: naming a
+        model-forwarded key as unread and advising its removal would break the
+        proxy candle feed, which is why the message asks for a declaration
+        rather than a deletion.
+
+        It stays a smoke alarm, not a filter: ``load_full_config`` /
+        ``save_full_config`` in config.py still preserve any key without
+        validating it, so rejecting on the write path remains the real fix.
+        """
+        from .config import AgentConfig
+
+        known = set(AgentConfig.model_fields) | set(self.strategy.default_config or {})
+        known |= _PLATFORM_CONFIG_KEYS
+        unknown = sorted(k for k in self.config if k not in known)
+        if unknown:
+            log.warning(
+                "Agent %s.%s config has undeclared keys: %s — they are shown to "
+                "the model as ACTIVE session values, but they are not an "
+                "AgentConfig field and not in the strategy's default_config. If a "
+                "key is meant to be live — including one only the playbook tells "
+                "the model to forward — declare it in the strategy's "
+                "default_config; drop it from the session config only if nothing "
+                "uses it.",
+                self.agent.slug,
+                self.strategy.slug,
+                ", ".join(unknown),
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -326,21 +424,40 @@ class TickEngine:
     # ------------------------------------------------------------------
 
     async def _loop(self) -> None:
-        freq = self.config.get("frequency_sec", 60)
         mode = self.config.get("execution_mode", "loop")
         while self._running:
+            # Re-read each pass: frequency_sec is editable mid-session, and the
+            # sleep below is the only thing that consumes it.
+            freq = self.config.get("frequency_sec", 60)
+            tick_started = time.monotonic()
             if not self._paused:
                 try:
-                    await self._tick()
+                    # Cleared BEFORE the tick, not after it returns: a tick that
+                    # skips itself (see _skip_tick) records why in _last_error,
+                    # and clearing on return would wipe it — leaving
+                    # get_info()["last_error"], which the dashboard renders,
+                    # showing a healthy agent while every tick is being skipped.
                     self._last_error = ""
+                    await self._tick()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self._last_error = str(e)
+                    # Always carry the class name, never a bare str(e): a hung
+                    # request raises a bare TimeoutError that stringifies to the
+                    # EMPTY string, and _tick's setup budget deliberately
+                    # re-raises exactly that kind of inner timeout so this
+                    # handler can record the real error — recorded as str(e) it
+                    # would blank out both the dashboard's last_error and the
+                    # journal line on the very failure they exist for. Formatted
+                    # unconditionally: emptiness is never a thing to branch on
+                    # (it does not identify the error — aiohttp's own errors
+                    # always stringify non-empty, bare timeouts never do).
+                    err = f"{type(e).__name__}: {e}"
+                    self._last_error = err
                     log.exception("TickEngine %s tick error", self.agent_id)
                     if self.journal:
-                        self.journal.append_error(str(e))
-                    await self._notify(f"Agent {self.agent_id} tick error: {e}")
+                        self.journal.append_error(err)
+                    await self._notify(f"Agent {self.agent_id} tick error: {err}")
 
                 # Record the tick we just finished. A tiny atomic write, so if
                 # the process dies mid-sleep the boot pass can say which tick
@@ -376,37 +493,123 @@ class TickEngine:
                     _supervisor().unregister(self.agent_id, LoopState.COMPLETED)
                     return
 
+            # frequency_sec is a PERIOD, not a post-tick pause: sleep only what
+            # is left of it after the tick's own wall time. Sleeping the full
+            # freq made the real period tick_duration + freq, so the sampling
+            # rate silently tracked backend latency (a 60s agent ticking every
+            # ~2.7min while probes timed out, ~1.5min once they failed fast) —
+            # a signal built on 1m candles was re-evaluated on a drifting clock.
+            #
+            # The floor applies only to a tick that actually OVERRAN: that
+            # means something upstream is slow, and closing the gap to zero
+            # would turn it into back-to-back LLM ticks against a struggling
+            # backend. A tick that kept up just sleeps the remainder, so
+            # frequency_sec is the true period at every frequency — flooring a
+            # keeping-up tick as well would stretch a freq=5 agent (elapsed=1,
+            # floor=min(10, 5)=5) to a 6s period, the very drift being fixed.
+            elapsed = time.monotonic() - tick_started
+            if elapsed > freq:
+                self._note_tick_overrun(elapsed, freq)
+            gap = freq - elapsed
+            if gap <= 0:
+                gap = min(_MIN_TICK_GAP_SEC, freq)
             try:
-                await asyncio.sleep(freq)
+                await asyncio.sleep(gap)
             except asyncio.CancelledError:
                 break
+
+    def _note_tick_overrun(self, elapsed: float, freq: float) -> None:
+        """Surface a tick that outran its own period.
+
+        Logged every time — that is what an operator greps — but journalled only
+        once per run: the Decisions section is read back into the next prompt
+        (``get_recent_decisions``), so one overrun note per outage is context and
+        a note per tick would push the agent's actual decisions out of view.
+        """
+        log.warning(
+            "TickEngine %s: tick took %.1fs, over frequency_sec=%s — the period "
+            "is now paced by tick duration, not by config",
+            self.agent_id,
+            elapsed,
+            freq,
+        )
+        if self.journal and not self._overrun_journalled:
+            self._overrun_journalled = True
+            self.journal.append_error(
+                f"tick took {elapsed:.0f}s, longer than frequency_sec={freq} — "
+                "ticks are running slower than configured"
+            )
+
+    def _skip_tick(self, msg: str) -> None:
+        """Record a tick that ran nothing, everywhere an operator looks.
+
+        The journal alone is not enough. ``_loop`` clears ``_last_error`` once
+        per pass — deliberately *before* calling ``_tick``, so what is recorded
+        here survives the tick's return. Clearing it afterwards (as the loop
+        used to) wiped every skip: a tick that returns early instead of raising
+        left ``get_info()["last_error"]`` empty, and an agent skipping every
+        tick against a dead API server looked perfectly healthy on the
+        dashboard.
+        """
+        log.warning("TickEngine %s: %s", self.agent_id, msg)
+        self._last_error = msg
+        if self.journal:
+            self.journal.append_error(msg)
 
     async def _tick(self) -> None:
         self._last_tick_at = time.time()
         mode = self.config.get("execution_mode", "loop")
 
-        # 1. Get API client
-        client = await self._get_client()
-        if not client:
-            if self.journal:
-                self.journal.append_error("No API client available")
+        # Steps 1-2 are pure setup: no LLM, no orders, nothing in flight. They
+        # are also every uncapped network call in the tick (client init, bot
+        # adoption, the core providers), so a dead API server can stall them for
+        # minutes. Bounding them here is safe precisely because nothing has been
+        # committed yet — the ACP span further down is deliberately NOT bounded
+        # this way, since cancelling mid-stream can abort a tick with orders in
+        # flight.
+        try:
+            async with asyncio.timeout(_SETUP_BUDGET_SEC) as setup_cm:
+                # 1. Get API client
+                client = await self._get_client()
+                if not client:
+                    self._skip_tick("No API client available")
+                    return
+
+                # 1b. Adopt any bot of ours already running (first tick only). A crash
+                # restart always mints a NEW session (see condor/runtime/loops.py), so the
+                # live bot must be taken over rather than orphaned and redeployed.
+                await self._adopt_running_bots(client)
+
+                # 2. Run core data providers (executors only -- agent uses MCP for market data)
+                skill_results = await self.provider_registry.run_core_providers(
+                    client,
+                    self.config,
+                    agent_id=self.agent_id,
+                    # Adoption above just refreshed the ledger, so its bases are exactly
+                    # the bots this session operates right now — including any extra one
+                    # it deployed beyond the configured name.
+                    bot_names=self.ledger.bases() if self.ledger else None,
+                )
+        except asyncio.TimeoutError:
+            # Only OUR deadline is handled here. A TimeoutError raised INSIDE
+            # _get_client / _adopt_running_bots / run_core_providers arrives as
+            # the same type — aiohttp's ServerTimeoutError subclasses it, and a
+            # market-data probe against an endpoint that hangs raises a bare one
+            # — and reporting that as "setup exceeded 45s" would aim the operator
+            # at the wrong layer, so it is re-raised for _loop to record as the
+            # real error. cm.expired() is the only reliable discriminator: never
+            # inspect str(e), which is empty for a bare TimeoutError.
+            if not setup_cm.expired():
+                raise
+            # Skip the tick rather than prompt the model with unknown executor
+            # state — an agent that can't see its own positions must not size a
+            # new entry. The message is written out in full because a bare
+            # TimeoutError stringifies to "", which would journal an empty line.
+            self._skip_tick(
+                f"tick setup (client, adoption, core data) exceeded "
+                f"{_SETUP_BUDGET_SEC:.0f}s — skipping this tick"
+            )
             return
-
-        # 1b. Adopt any bot of ours already running (first tick only). A crash
-        # restart always mints a NEW session (see condor/runtime/loops.py), so the
-        # live bot must be taken over rather than orphaned and redeployed.
-        await self._adopt_running_bots(client)
-
-        # 2. Run core data providers (executors only -- agent uses MCP for market data)
-        skill_results = await self.provider_registry.run_core_providers(
-            client,
-            self.config,
-            agent_id=self.agent_id,
-            # Adoption above just refreshed the ledger, so its bases are exactly
-            # the bots this session operates right now — including any extra one
-            # it deployed beyond the configured name.
-            bot_names=self.ledger.bases() if self.ledger else None,
-        )
 
         # Extract structured data from providers for tracking
         executors_result = skill_results.get("executors")
@@ -509,6 +712,14 @@ class TickEngine:
             self._pending_directives.clear()
 
         # 6. Create a fresh agent client per tick (clean context window)
+        # Deliberately NOT budgeted, unlike the setup block above and start()
+        # below: _create_client only assembles config, and both of the calls it
+        # makes (build_mcp_servers_for_session, resolve_custom_endpoint) are
+        # plain sync functions, so the coroutine contains no await point at all.
+        # asyncio.timeout can only fire at a suspension point, so a budget here
+        # could never interrupt it — and a sync call that did hang would freeze
+        # the whole event loop, a different failure with a different fix (move
+        # the work to a thread, not wrap it in a deadline).
         acp_client = await self._create_client(risk_state)
         self._active_client = acp_client
 
@@ -516,21 +727,38 @@ class TickEngine:
         tool_calls: list[dict[str, Any]] = []
         tool_call_map: dict[str, dict[str, Any]] = {}
 
-        await acp_client.start()
+        # Startup is its own unbounded await chain (subprocess spawn, then
+        # initialize / session/new / set_model, none of which the JSON-RPC peer
+        # times out), so it gets its own budget. On timeout the client may still
+        # have spawned a subprocess — the finally below reaps it either way.
+        started = False
         try:
-            async with asyncio.timeout(300):
-                async for event in self._collect_stream(acp_client, prompt):
-                    if isinstance(event, TextChunk):
-                        response_chunks.append(event.text)
-                    elif isinstance(event, (ToolCallEvent, ToolCallUpdate)):
-                        new_tc = fold_tool_call_event(tool_call_map, event)
-                        if new_tc is not None:
-                            tool_calls.append(new_tc)
+            async with asyncio.timeout(_CLIENT_START_BUDGET_SEC):
+                await acp_client.start()
+            started = True
+        except asyncio.TimeoutError:
+            log.warning(
+                "TickEngine %s: agent client startup exceeded %.0fs",
+                self.agent_id,
+                _CLIENT_START_BUDGET_SEC,
+            )
+            response_chunks.append("(client startup timed out)")
+
+        try:
+            if started:
+                async with asyncio.timeout(300):
+                    async for event in self._collect_stream(acp_client, prompt):
+                        if isinstance(event, TextChunk):
+                            response_chunks.append(event.text)
+                        elif isinstance(event, (ToolCallEvent, ToolCallUpdate)):
+                            new_tc = fold_tool_call_event(tool_call_map, event)
+                            if new_tc is not None:
+                                tool_calls.append(new_tc)
         except asyncio.TimeoutError:
             log.warning("TickEngine %s: ACP prompt timed out", self.agent_id)
             response_chunks.append("(timed out)")
         finally:
-            await acp_client.stop()
+            await self._reap_client(acp_client)
             self._active_client = None
 
         response_text = "".join(response_chunks)
@@ -671,6 +899,81 @@ class TickEngine:
             if isinstance(event, PromptDone):
                 break
 
+    async def _reap_client(self, client) -> None:
+        """Tear the per-tick client down without letting teardown own the tick.
+
+        Teardown used to be an unbounded ``await client.stop()`` in the tick's
+        finally, outside every timeout in this method. session_6 tick #5 recorded
+        a 2720.9s duration with a completed stream, a still "pending" last tool
+        call and no "(timed out)" marker, so those 45 minutes went somewhere
+        other than the prompt — but the trace does not say where, and teardown is
+        only one candidate: the then-uncapped setup span is another (config_manager
+        holds a per-server client lock across an uncapped init on a dead server).
+        ``ACPClient.stop()`` is in fact mostly self-bounded — ~18s worst case
+        across its two ``ps`` snapshots and its 5s/3s process waits — and its one
+        unbounded span is ``await task`` on the read/stderr readers after
+        ``.cancel()``. The bound below is worth having on its own merits; do not
+        read it as a diagnosis of that tick.
+
+        Shielded rather than cancelled, deliberately. ``ACPClient.stop()`` kills
+        a whole process tree — it snapshots the agent's descendants (its MCP
+        stdio servers reparent and become unfindable once the parent dies),
+        SIGTERMs them, waits, then SIGKILLs the survivors. Cancelling that
+        half-way is exactly how those children are orphaned, and an orphaned MCP
+        server still holds this session's credentials. So the reap runs as its
+        own task and is never interrupted: we wait a bounded time for it, and if
+        it overruns we log and let the tick finish while the reap continues in
+        the background. Only our *waiting* is bounded, never the kill.
+
+        The engine's own ``_active_client`` backstop is cleared by the caller on
+        the normal path, leaving the detached reap the only owner — a second
+        concurrent ``stop()`` on the same process tree would only race it. It is
+        NOT cleared when the tick is cancelled mid-wait: ``asyncio.wait_for``
+        then raises ``CancelledError``, a ``BaseException`` that the
+        ``except Exception`` below does not catch, so the caller's assignment is
+        skipped and ``TickEngine.stop()``'s backstop calls ``stop()`` a second
+        time alongside the still-running reap. That is tolerated rather than
+        prevented — ``ACPClient.stop()`` nulls ``self._process`` when it finishes
+        and ``Process.wait()`` is multi-waiter safe — but it is a race, not an
+        invariant.
+        """
+        task = asyncio.create_task(client.stop())
+        self._reaping.add(task)
+        task.add_done_callback(self._reap_done)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), _CLIENT_STOP_WAIT_SEC)
+        except asyncio.TimeoutError:
+            log.warning(
+                "TickEngine %s: agent client teardown still running after %.0fs "
+                "— continuing the tick, reap left to finish in the background",
+                self.agent_id,
+                _CLIENT_STOP_WAIT_SEC,
+            )
+        except Exception:
+            log.exception("TickEngine %s: agent client teardown failed", self.agent_id)
+
+    def _reap_done(self, task) -> None:
+        """Drop a finished reap and consume its result.
+
+        A bare ``self._reaping.discard`` leaves the exception unretrieved
+        whenever ``stop()`` fails *after* the bounded wait in ``_reap_client``
+        has already given up — asyncio then logs "Task exception was never
+        retrieved" at garbage-collection time, detached from the tick it belongs
+        to. Logged with ``%r`` because a bare ``TimeoutError`` stringifies to the
+        empty string.
+        """
+        self._reaping.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning(
+                "TickEngine %s: agent client teardown failed after the wait gave "
+                "up: %r",
+                self.agent_id,
+                exc,
+            )
+
     # ------------------------------------------------------------------
     # Client factory
     # ------------------------------------------------------------------
@@ -774,23 +1077,56 @@ class TickEngine:
         server = cm.get_server(server_name)
         return server_name, server
 
-    async def _get_client(self):
-        """Get the Hummingbot API client for this agent."""
+    async def _get_client(self, force: bool = False):
+        """Get the Hummingbot API client for this agent.
+
+        ``force=True`` bypasses ConfigManager's negative connect cache. It is
+        for emergency paths only -- use :meth:`_get_client_emergency`, which is
+        the sole caller.
+        """
         try:
+            from config_manager import get_config_manager
+
             server_name, server = self._resolve_server()
             if not server:
                 from handlers.bots._shared import get_bots_client
 
+                if force:
+                    # get_bots_client resolves the server itself and calls
+                    # cm.get_client() with no force, so this branch could still
+                    # be refused in 0.000s by a cached failure some unrelated
+                    # tick or dashboard poll recorded. We cannot name the server
+                    # to force it -- get_bots_client picks it -- so clear the
+                    # cache instead. It is only an optimisation; the cost is
+                    # that other callers pay one real connect attempt again.
+                    get_config_manager().clear_client_failures()
                 client, _ = await get_bots_client(self.chat_id)
                 return client
 
-            from config_manager import get_config_manager
-
             cm = get_config_manager()
-            return await cm.get_client(server_name)
-        except Exception:
+            return await cm.get_client(server_name, force=force)
+        except Exception as e:
             log.exception("Failed to get API client for agent %s", self.agent_id)
+            # Keep the real reason: this method reports failure as a bare None,
+            # so without this the only thing downstream knows is "no client" and
+            # the only thing it can say is a guess. run_shutdown quotes this
+            # verbatim rather than asserting a cause of its own.
+            self._last_client_error = f"{type(e).__name__}: {e}"
             return None
+
+    async def _get_client_emergency(self):
+        """Acquire the API client for an emergency winddown.
+
+        Identical to :meth:`_get_client` except that it is never refused by
+        ConfigManager's negative connect cache. The kill switch closes open
+        positions: being told "unreachable" in 0.000s by an entry an unrelated
+        dashboard poll left behind seconds ago would abort the winddown with
+        positions still open, having never touched the network. Called only
+        from :func:`condor.agents.shutdown.run_shutdown`; ordinary ticks keep
+        the cache, which is what stops a queue of waiters from each paying its
+        own connect budget against a server already known to be down.
+        """
+        return await self._get_client(force=True)
 
     async def _notify(self, message: str) -> None:
         """Send a notification to the user via Telegram."""

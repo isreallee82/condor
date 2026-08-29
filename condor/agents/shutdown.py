@@ -364,17 +364,58 @@ async def run_shutdown(engine: Any, reason: str) -> None:
             f"{reason} (policy={policy.on_kill_switch})",
         )
 
-    client = await engine._get_client()
+    # Emergency acquisition: bypass ConfigManager's negative connect cache
+    # (TickEngine._get_client_emergency -> get_client(force=True)) so a failure
+    # entry an unrelated tick, routine run or dashboard poll left behind in the
+    # last 20s cannot cost the winddown its only connect attempt. Without it the
+    # acquisition returns None in 0.000s having never touched the network, and
+    # the kill switch lands on the "could NOT reach the API" branch below with
+    # positions still open.
+    #
+    # Resolved via getattr because this function takes a duck-typed ``engine``
+    # (see the ``Any`` annotation): a stand-in without the emergency getter
+    # still gets the ordinary one instead of a TypeError.
+    get_client = getattr(engine, "_get_client_emergency", engine._get_client)
+    client = await get_client()
     if client is None:
+        # _get_client reports failure as a bare None, so the headline below is
+        # all this function can say on its own. Quote the recorded exception
+        # instead of characterising the fault: "could not reach" is right for a
+        # refused connect but wrong for a 401 or a 500 from a server that
+        # answered, and the operator acting on this alert needs the real one.
+        why = getattr(engine, "_last_client_error", None)
+        # "could not acquire an API client" is all that is known here. The old
+        # "could NOT reach the API" was wrong for a 401, a 500, or a hung server
+        # that answered the connect -- and this is the highest-stakes message the
+        # system sends, so it must not name a cause the exception does not prove.
         msg = (
-            f"🚨 Agent {agent_id}: emergency shutdown could NOT reach the API — "
-            f"positions may be OPEN, check manually! ({reason})"
+            f"🚨 Agent {agent_id}: emergency shutdown could NOT acquire an API "
+            f"client — positions may be OPEN, check manually! ({reason})"
         )
+        if why:
+            msg += f"\nClient acquisition failed with: {why}"
+            # Only claim the cache was bypassed when the emergency getter was
+            # actually used. A duck-typed engine without it (the getattr above
+            # supports exactly that) never bypasses anything, and a
+            # ValueError from server resolution never reaches a socket.
+            bypassed = (
+                hasattr(engine, "_get_client_emergency")
+                and not isinstance(why, ValueError)
+            )
+            if bypassed:
+                msg += " (a real connect was attempted — the negative cache was bypassed)"
+        else:
+            msg += "\nNo acquisition error was recorded; the cause is NOT established."
         log.error(msg)
         await engine._notify(msg)
         if engine.journal:
+            detail = (
+                f"no API client: {why}"
+                if why
+                else "no API client (cause not recorded)"
+            )
             engine.journal.append_action(
-                engine.journal.tick_count + 1, "shutdown_failed", "no API client"
+                engine.journal.tick_count + 1, "shutdown_failed", detail
             )
             engine.journal.record_tick("shutdown failed (no client): " + reason)
         return

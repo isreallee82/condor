@@ -108,6 +108,80 @@ def _agent_of(routine) -> str:
     return src.split(":", 1)[1] if src.startswith("agent:") else "condor"
 
 
+# Wall-clock budget for ONE one-shot run — OPT-IN on both sides, never a
+# store-wide default.
+#
+# Some one-shot callers do have a deadline: the MCP runner
+# (mcp_servers/condor/tools/routines.py, _RUN_BUDGET = 120s) only *abandons* its
+# poll when that expires, so without a cap the run keeps going, detached from
+# anyone who will ever read it, still hammering whatever hung it — while the
+# agent's next tick starts another one. But the very same store entrypoint
+# serves the dashboard: ``POST /routines/{...}/run`` and ``POST /routines/run``
+# (condor/web/routes/routines.py) hand back an instance_id immediately and the
+# browser polls with NO deadline. A default cap there is a pure regression —
+# it would hard-cancel, and record `failed`, exactly the long runs that path
+# exists for (``market_scanner`` defaults to top_n=100 pairs, backtest_compare,
+# hip3_pairs_backtest, solana_pool_scanner). So a budget applies only when
+# somebody asks for one:
+#
+#   * a routine that wants a cap on itself sets ``RUN_BUDGET_SEC = <seconds>``
+#     at module level in its own source file (absent or ``0`` => uncapped);
+#   * a caller that has its own deadline passes ``timeout_sec`` to
+#     ``RoutineStore.execute``.
+#
+# One-shot only either way. Continuous and scheduled runs are long-lived by
+# design and nobody polls them, so a cap there would just kill working routines.
+
+
+class RoutineBudgetExceeded(Exception):
+    """A routine run was cancelled for outliving its wall-clock budget."""
+
+
+def _run_budget(routine, requested: float | None = None) -> float | None:
+    """The budget for one run of ``routine``, or ``None`` for uncapped.
+
+    A module-level ``RUN_BUDGET_SEC`` in the routine's own source file wins: it
+    is the author's statement about their own runtime, so it both imposes a cap
+    where the caller asked for none and lifts one (``0``) that the caller asked
+    for but the routine cannot meet. It is read off the run function's module
+    globals rather than a ``RoutineInfo`` field, so a routine can declare it
+    without any change to routine discovery.
+
+    Failing that, the caller's ``requested`` budget applies — and failing both,
+    nothing does. There is deliberately no default here: most one-shot runs come
+    from the dashboard, which waits as long as the routine takes.
+    """
+    override = getattr(routine.run_fn, "__globals__", {}).get("RUN_BUDGET_SEC")
+    if isinstance(override, (int, float)) and not isinstance(override, bool):
+        return float(override) if override > 0 else None
+    return requested if requested and requested > 0 else None
+
+
+async def _run_within_budget(routine, cfg, ctx, budget: float):
+    """Await one routine run, cancelling it if it outlives ``budget``.
+
+    The breach is re-raised as :class:`RoutineBudgetExceeded` rather than left as
+    a ``TimeoutError``, because a timeout raised *inside* the routine (an
+    exchange probe giving up, say) reaches this frame as the very same type —
+    and a bare ``TimeoutError`` stringifies to the empty string, so the record
+    could not tell the two apart. ``cm.expired()`` is the only reliable
+    discriminator: it is true only when this deadline is what cancelled the run.
+    """
+    try:
+        async with asyncio.timeout(budget) as cm:
+            return await routine.run_fn(cfg, ctx)
+    except TimeoutError:
+        if not cm.expired():
+            raise  # the routine's own timeout — report it as the routine's
+        raise RoutineBudgetExceeded(
+            f"cancelled after {budget:g}s (one-shot run budget). If this "
+            "routine legitimately runs longer, raise or remove the module-level "
+            "RUN_BUDGET_SEC in its source file (0 = no cap); if the budget came "
+            "from the caller instead, start the routine in the background and "
+            "read its result from the dashboard."
+        ) from None
+
+
 class WebRoutineContext:
     """Lightweight context so routines can run without Telegram."""
 
@@ -316,6 +390,7 @@ class RoutineStore:
         failed_status: str | None = None,
         fire_hooks: bool = True,
         agent: str = "",
+        timeout_sec: float | None = None,
     ) -> None:
         """Run a routine once, store the result, update instance metadata, fire hooks.
 
@@ -331,6 +406,11 @@ class RoutineStore:
         via ``_agent_of``; the MCP runner passes it because it knows which
         assistant asked — which differs from the source when an agent runs a
         routine from the general library.
+
+        ``timeout_sec`` caps the run itself and records the breach as a failure
+        rather than leaving the instance ``running`` for good. Only the one-shot
+        path passes it, and only when something opted in (see ``_run_budget``);
+        ``None`` — the usual case — runs uncapped.
         """
         ctx = WebRoutineContext(server_name, bot=self._bot, chat_id=user_id)
         start = time.time()
@@ -340,10 +420,21 @@ class RoutineStore:
         try:
             cfg = routine.config_class(**config)
             with reports.attribute_to(agent or _agent_of(routine)):
-                raw = await routine.run_fn(cfg, ctx)
+                if timeout_sec:
+                    raw = await _run_within_budget(routine, cfg, ctx, timeout_sec)
+                else:
+                    raw = await routine.run_fn(cfg, ctx)
             result = normalize_result(raw)
         except asyncio.CancelledError:
             result = RoutineResult(text="Stopped by user")
+        except RoutineBudgetExceeded as e:
+            # Its own arm, above the generic one: the message already says
+            # everything (the generic arm would prefix a class name and dump a
+            # traceback that points at the timeout, not at what actually hung).
+            error_msg = str(e)
+            logger.warning(f"Routine {routine.name}[{instance_id}] {error_msg}")
+            result = RoutineResult(text=f"Error: {error_msg}")
+            failed = True
         except Exception as e:
             tb = traceback.format_exc()
             logger.error(
@@ -402,10 +493,18 @@ class RoutineStore:
         server_name: str,
         user_id: int = 0,
         agent: str = "",
+        timeout_sec: float | None = None,
     ) -> str:
         """Run a one-shot routine from the web. Returns instance_id.
 
         ``agent`` overrides report attribution (see ``_execute_and_record``).
+
+        ``timeout_sec`` is for a caller that has its own deadline and would
+        abandon the run at it anyway: the run is then cancelled and recorded
+        ``failed`` instead of being left ``running`` with nobody reading it.
+        Omitted — as the dashboard omits it, having no deadline — the run is
+        uncapped. A routine's own ``RUN_BUDGET_SEC`` still overrides either
+        way; see ``_run_budget``.
         """
         routine = self._resolve_routine(routine_name)
         if not routine:
@@ -418,7 +517,13 @@ class RoutineStore:
 
         task = asyncio.create_task(
             self._run_oneshot(
-                instance_id, routine, config, server_name, user_id, agent=agent
+                instance_id,
+                routine,
+                config,
+                server_name,
+                user_id,
+                agent=agent,
+                timeout_sec=timeout_sec,
             )
         )
         self._tasks[instance_id] = task
@@ -432,6 +537,7 @@ class RoutineStore:
         server_name: str,
         user_id: int = 0,
         agent: str = "",
+        timeout_sec: float | None = None,
     ) -> None:
         await self._execute_and_record(
             instance_id,
@@ -442,6 +548,10 @@ class RoutineStore:
             status_after="completed",
             failed_status="failed",
             agent=agent,
+            # Capped only when the routine declares a budget for itself or this
+            # caller asked for one — the dashboard, which polls without a
+            # deadline, asks for none and its runs stay uncapped.
+            timeout_sec=_run_budget(routine, timeout_sec),
         )
 
     async def start_continuous(

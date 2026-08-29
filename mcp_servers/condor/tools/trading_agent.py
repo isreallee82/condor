@@ -541,6 +541,37 @@ def journal_write(
     tick: int = 0,
     category: str = "",
 ) -> dict:
+    """Write one journal entry and report what actually happened to it.
+
+    entry_type:
+      - "action" (or anything unrecognised): appended to the tick log.
+      - "state": overwrites the state snapshot.
+      - "learning": appended to learnings.md, unless it repeats an entry that is
+        already there, in which case NOTHING is written.
+      - "correction": the supersede path -- REPLACES the existing learning this
+        text corrects instead of appending beside it, and retires the old text.
+        Pass the verbatim text (or a distinctive fragment) of the entry being
+        replaced in ``reasoning`` to name the target explicitly; leave it empty
+        to let the writer pick the entry this text most closely matches. Either
+        way the entry that was replaced comes back in ``replaced`` -- check it.
+
+    "correction" exists because append is the only other write path: there is no
+    edit or delete tool, and the learnings sections are re-asserted to the agent
+    in every tick prompt, so without it a learning the agent has MEASURED to be
+    wrong could never be fixed by that agent. Dedup is a word overlap that
+    cannot see negation, so a reversal of a wrong entry otherwise scores like a
+    repeat of it and is dropped.
+
+    Returns:
+        Learning writes return the writer's own verdict --
+        ``{"written": bool, "status": ..., "detail": ...}`` plus
+        ``duplicate_of`` / ``replaced`` / ``overlap`` / ``retired`` / ``hint``
+        where they apply. ``written: false`` means the text is NOT in
+        learnings.md and will not be in the next tick prompt; ``detail`` says
+        why, naming the entry it was measured against. This used to return
+        ``{"written": True}`` no matter what the writer did, so a suppressed
+        correction was reported to the agent as a successful write.
+    """
     if not agent_id:
         return {"error": "agent_id is required"}
     if not text:
@@ -575,9 +606,25 @@ def journal_write(
         return {"error": "no journal available for this agent"}
     jm = JournalManager(agent_id, session_dir=session_dir, agent_dir=agent_dir)
 
-    if entry_type == "learning":
-        jm.append_learning(text, category=category or "market")
-    elif entry_type == "state":
+    if entry_type in ("learning", "correction"):
+        # Consume the writer's verdict instead of asserting success: a learning
+        # can be suppressed as a duplicate, and the agent is the only party that
+        # can rephrase it, correct it or escalate.
+        result = jm.write_learning(
+            text,
+            category=category or "market",
+            supersede=entry_type == "correction",
+            replaces=reasoning if entry_type == "correction" else "",
+        )
+        if result.get("status") == "duplicate":
+            result["hint"] = (
+                "If this CORRECTS that entry rather than repeating it, call this "
+                'tool again with entry_type="correction" and the same text '
+                '(optionally reasoning="<verbatim text of the entry you are '
+                'replacing>"). Nothing else can change an existing learning.'
+            )
+        return result
+    if entry_type == "state":
         jm.write_state(text)
     else:
         jm.append_action(tick, text, reasoning, risk_note)
