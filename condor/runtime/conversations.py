@@ -7,9 +7,10 @@ budget eviction or a crashed ACP bridge silently deleted the chat.
 They are separate here. The session still dies with the process — that is what
 a subprocess is. The conversation is a directory:
 
-    condor/.runtime/conversations/{user_id}/{conv_id}/
-        meta.json          # atomic merge, via registry_file.write_status()
-        transcript.jsonl   # append-only, one JSON object per line
+    .condor/users/{user_id}/conversations/{conv_id}/
+        meta.json                  # atomic merge, via registry_file.write_status()
+        transcript.jsonl           # append-only, bounded; one JSON object per line
+        transcript_archive.jsonl   # turns retired out of the file above
 
 Same idiom as the rest of the runtime's durable facts: ``registry_file`` for
 atomic status, ``journal.py`` for an append-only narrative. No database.
@@ -32,11 +33,15 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
+from itertools import chain, islice
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from condor import paths
+from condor.fsutil import atomic_write_bytes
 from condor.runtime.events import EventType
 from condor.runtime.registry_file import read_status, write_status
 
@@ -44,10 +49,7 @@ log = logging.getLogger(__name__)
 
 META_FILENAME = "meta.json"
 TRANSCRIPT_FILENAME = "transcript.jsonl"
-
-# conv_id and user_id both become directory names, so neither may escape one.
-# Same guard, same reason, as state.py's namespace check.
-_SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+TRANSCRIPT_ARCHIVE_FILENAME = "transcript_archive.jsonl"
 
 # Upper bound on the replayed transcript, in characters. Load-bearing, not
 # cosmetic: a 300-turn conversation replayed whole would eat the context
@@ -59,14 +61,67 @@ REPLAY_MAX_CHARS = int(os.environ.get("CONDOR_REPLAY_MAX_CHARS", "6000") or 6000
 REPLAY_HEADER = "Previously in this chat:"
 REPLAY_OMITTED = "(older turns omitted)"
 
+# Bytes pulled per backwards read of a transcript. One block already covers a
+# replay's whole char budget many times over; it only ever grows when a single
+# turn is bigger than this.
+_TAIL_BLOCK_BYTES = 64 * 1024
+
+# Retention for the live transcript. The file is append-only, so without a
+# sweep its footprint grows for the life of the conversation — PERF-138 made
+# *reading* it cheap, not writing it. Past ``MAX`` bytes the oldest turns are
+# **moved**, never deleted, to ``transcript_archive.jsonl`` beside it; the live
+# file keeps the newest ``KEEP`` bytes plus one marker turn naming the sidecar
+# and how many turns went into it. Same shape as PERF-136's journal archive and
+# for the same reason: this is the user's own chat history, so a retention
+# policy whose failure mode is "the chat is gone" is not one worth having.
+#
+# Bounded in bytes rather than in turns because bytes are what grow: one turn
+# runs from ~100 B to ~3 KB (a tool call keeps up to ``TOOL_INPUT_MAX_CHARS`` +
+# ``TOOL_OUTPUT_MAX_CHARS`` of payload), so a turn count would pin the
+# footprint only to within a factor of thirty. It also makes the trigger a
+# single ``stat()`` on the append path rather than a line count.
+#
+# MAX and KEEP are deliberately far apart: a trim leaves the file at KEEP, so
+# the next one is a whole MAX−KEEP of appends away and the rewrite amortizes to
+# a constant per byte appended. They are read from the environment here, beside
+# ``REPLAY_MAX_CHARS`` and for the same reason, rather than from
+# ``timeouts.py``, whose loader only understands deadlines in seconds.
+TRANSCRIPT_MAX_BYTES = int(
+    os.environ.get("CONDOR_TRANSCRIPT_MAX_BYTES", "2097152") or 2097152
+)
+TRANSCRIPT_KEEP_BYTES = int(
+    os.environ.get("CONDOR_TRANSCRIPT_KEEP_BYTES", "1048576") or 1048576
+)
+
+# The kept tail is never allowed below this multiple of the replay budget, and
+# that is the load-bearing half of the policy: ``replay_context`` reads the live
+# file only, so a trim must never be able to change what a resumed session is
+# handed. Holding the tail well above ``REPLAY_MAX_CHARS`` guarantees a trim
+# only ever removes turns that were already past the replay bound — the replay
+# is identical before and after. A rendered replay line is a strict subset of
+# the JSON line it came from, so bytes here dominate chars there; the multiple
+# is slack on top of that.
+_REPLAY_HEADROOM = 4
+
+# The turn left behind in place of the archived ones. A real ``system`` entry
+# rather than a bespoke line format, so every existing reader already handles
+# it: the dashboard renders it like any other system note, ``read_transcript``
+# returns it, and ``_render_turn`` would replay it as "(N older turns moved to
+# …)" if a replay window ever reached back that far. The count is folded
+# forward on each trim, so the file states the running total and never claims
+# to be a complete record when it is not.
+ARCHIVE_MARKER_KIND = "archived"
+_ARCHIVE_MARKER_RE = re.compile(r"^(\d+) older turns? moved to ")
+
 TITLE_MAX_CHARS = 80
 SNIPPET_MAX_CHARS = 160
 
 # Upper bounds on the tool IO kept per call, in characters. Load-bearing, not
 # defensive: a tool result is routinely a market-data dump, a whole portfolio
-# payload or a base64 image, and the transcript has no retention sweep — kept
-# verbatim, one turn could outweigh the entire conversation and slow every
-# read of the file. They live here, beside ``REPLAY_MAX_CHARS`` and for the
+# payload or a base64 image — kept verbatim, one turn could outweigh the
+# entire conversation, slow every read of the file and, since PERF-170, push
+# the rest of the chat into the archive on its own. They live here, beside
+# ``REPLAY_MAX_CHARS`` and ``TRANSCRIPT_MAX_BYTES``, and for the
 # same reason, rather than in ``timeouts.py``: that policy is
 # deadlines-in-seconds parsed from ``CONDOR_TIMEOUT_*``, and a character count
 # would not survive its loader.
@@ -115,12 +170,19 @@ def _utcnow() -> datetime:
 
 
 def _validate(value: str) -> str:
-    if not value or not _SAFE_ID.match(value):
+    """``paths.safe_id`` under this module's own error type.
+
+    The guard is shared (one regex, in ``condor.paths``); the exception is not,
+    because ``chat_ws`` and the conversations route both catch
+    :class:`ConversationIdError` to answer 400 rather than 500.
+    """
+    try:
+        return paths.safe_id(value)
+    except paths.UnsafeIdError as exc:
         raise ConversationIdError(
             f"Invalid conversation id {value!r}: "
             "use letters, digits, dot, dash or underscore."
-        )
-    return value
+        ) from exc
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -184,6 +246,15 @@ class ConversationMeta(BaseModel):
     Extra keys on disk are ignored (pydantic's default), so a meta written
     before a field was dropped — ``mode``, retired with the persona axis in
     FEAT-033 — still loads instead of failing the whole conversation list.
+
+    ``share_delete_token`` is the one field that is read from disk but never
+    serialized. It is a *capability*: whoever holds it can delete the shared
+    row from the collector, which is exactly why the owner keeps it and nobody
+    else receives it. Every route that returns a conversation dumps this model,
+    and one of them (``?user_id=``, admin only) returns someone else's — so a
+    plain field would hand an admin the token for a share that is not theirs to
+    revoke. ``exclude=True`` keeps it out of every dump; writes go through
+    ``update_meta``'s explicit kwargs, which are unaffected.
     """
 
     id: str
@@ -199,6 +270,41 @@ class ConversationMeta(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
     turn_count: int = 0
     last_snippet: str = ""
+
+    # ── Sharing (FEAT-054) ──
+    # Optional, defaulted, and tolerated in both directions like every other
+    # field here: a meta written before this existed loads unchanged, and one
+    # written by a newer build still loads in an older one.
+    share_id: str = Field(
+        default="",
+        description="Stable per conversation once shared; '' = never shared.",
+    )
+    share_revision: int = Field(
+        default=0, description="Bumped on each re-share; the server upserts on it."
+    )
+    shared_at: datetime | None = None
+    share_delete_token: str = Field(
+        default="",
+        exclude=True,
+        description="The capability that revokes the share. Local only.",
+    )
+
+    # ── Automatic sharing (FEAT-055) ──
+    share_excluded: bool = Field(
+        default=False,
+        description="The user took this one chat out of the sweep. Honoured forever.",
+    )
+    share_turn_count: int = Field(
+        default=0,
+        description="``turn_count`` at the last share; growth past it re-shares.",
+    )
+    multi_author: bool = Field(
+        default=False,
+        description=(
+            "Another human can speak in the room this was born in — a Telegram "
+            "group. The sweep never takes one: a user consents for themselves."
+        ),
+    )
 
 
 class TurnEntry(BaseModel):
@@ -236,7 +342,11 @@ class TurnEntry(BaseModel):
         description="Per call: id, title, status, kind, input, output.",
     )
     kind: str = Field(
-        default="", description="System entries only: switch | error | delegation."
+        default="",
+        description=(
+            "System entries only: switch | error | delegation | resume | "
+            "notification."
+        ),
     )
     ts: float = Field(default_factory=time.time)
     agent_key: str = Field(default="", description="Model that produced this turn.")
@@ -251,23 +361,13 @@ class TurnEntry(BaseModel):
 # ── Paths ──
 
 
-def _root() -> Path:
-    """Where every conversation lives.
-
-    Derived from ``_DATA_ROOT`` exactly as ``state.py`` derives its own root, so
-    a test that repoints one repoints both.
-    """
-    from condor.agents.agent import _DATA_ROOT
-
-    return Path(_DATA_ROOT).parent / "condor" / ".runtime" / "conversations"
-
-
 def _user_dir(user_id: int | str) -> Path:
-    return _root() / _validate(str(user_id))
+    """This user's conversations. The store is partitioned by owner (FEAT-051)."""
+    return paths.conversations_dir(_validate(str(user_id)))
 
 
 def _conv_dir(user_id: int | str, conv_id: str) -> Path:
-    return _user_dir(user_id) / _validate(str(conv_id))
+    return paths.conversation_dir(_validate(str(user_id)), _validate(str(conv_id)))
 
 
 # ── Store ──
@@ -280,8 +380,17 @@ def new_conversation(
     agent_key: str = "",
     agent_slug: str = "",
     server_name: str | None = None,
+    multi_author: bool = False,
 ) -> ConversationMeta:
-    """Mint an empty conversation and persist its meta."""
+    """Mint an empty conversation and persist its meta.
+
+    ``multi_author`` is recorded at birth because that is the only moment the
+    fact is known: a turn carries which *brain* produced it but not which human
+    typed it, and the recorder is built from the session's owner, so by the time
+    a second person's words are on disk they are indistinguishable from the
+    owner's. The caller who provisioned the session knows whether the room admits
+    anyone else, and says so here (FEAT-055).
+    """
     now = _utcnow()
     meta = ConversationMeta(
         id=uuid.uuid4().hex[:12],
@@ -292,6 +401,7 @@ def new_conversation(
         server_name=server_name,
         created_at=now,
         updated_at=now,
+        multi_author=bool(multi_author),
     )
     write_status(_conv_dir(user_id, meta.id), META_FILENAME, **_meta_fields(meta))
     return meta
@@ -339,13 +449,57 @@ def list_conversations(user_id: int, *, limit: int = 100) -> list[ConversationMe
     return metas[:limit] if limit else metas
 
 
-def read_transcript(user_id: int, conv_id: str, *, limit: int = 200) -> list[TurnEntry]:
-    """The tail of a transcript. ``limit=0`` means all of it.
+def _iter_lines_reverse(path: Path, *, block: int | None = None) -> Iterator[bytes]:
+    """The file's non-blank lines, newest first, reading only what is consumed.
 
-    A line that fails to parse is skipped, never fatal — the same tolerance
-    ``read_status()`` shows for a truncated status file.
+    Opened in binary and split on ``b"\\n"``: no UTF-8 continuation byte is
+    ``0x0A``, so a block boundary can cut a character in half but never a line.
+    A record is always one line — ``append_turn`` writes ``json.dumps`` output,
+    which escapes newlines — so a line is a whole turn, and the last one is
+    yielded whether or not it ends in a newline (a torn append reads as a
+    malformed line, exactly as it does on the forward path).
     """
-    path = _conv_dir(user_id, conv_id) / TRANSCRIPT_FILENAME
+    size = block or _TAIL_BLOCK_BYTES
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        carry = b""
+        while pos > 0:
+            step = min(size, pos)
+            pos -= step
+            fh.seek(pos)
+            lines = (fh.read(step) + carry).split(b"\n")
+            # The first piece may continue into the block before this one.
+            carry = lines.pop(0)
+            for line in reversed(lines):
+                line = line.strip()
+                if line:
+                    yield line
+        carry = carry.strip()
+        if carry:
+            yield carry
+
+
+def _iter_turns_reverse(path: Path) -> Iterator[TurnEntry]:
+    """Parsed turns, newest first, parsing only the lines the caller pulls.
+
+    Same tolerance as the forward read: a line that will not parse is skipped,
+    an unreadable file is empty rather than fatal.
+    """
+    try:
+        if not path.is_file():
+            return
+        for line in _iter_lines_reverse(path):
+            try:
+                yield TurnEntry(**json.loads(line.decode("utf-8")))
+            except Exception:  # noqa: BLE001 - one bad line is not the file
+                continue
+    except OSError:
+        log.debug("Unreadable transcript at %s", path, exc_info=True)
+
+
+def _read_turns(path: Path) -> list[TurnEntry]:
+    """Every turn in one file, oldest first. Absent or unreadable reads empty."""
     entries: list[TurnEntry] = []
     try:
         if not path.is_file():
@@ -362,7 +516,57 @@ def read_transcript(user_id: int, conv_id: str, *, limit: int = 200) -> list[Tur
     except OSError:
         log.debug("Unreadable transcript at %s", path, exc_info=True)
         return []
-    return entries[-limit:] if limit else entries
+    return entries
+
+
+def read_transcript(
+    user_id: int,
+    conv_id: str,
+    *,
+    limit: int = 200,
+    include_archive: bool = False,
+) -> list[TurnEntry]:
+    """The tail of a transcript. ``limit=0`` means all of it.
+
+    A line that fails to parse is skipped, never fatal — the same tolerance
+    ``read_status()`` shows for a truncated status file.
+
+    A bounded tail is read backwards from the end, so a conversation with
+    thousands of turns costs its tail rather than its whole history; only
+    ``limit=0`` still walks the file.
+
+    "All of it" means the live transcript, which retention bounds — a long
+    conversation's older turns live in the sidecar and are represented in the
+    result by the archive marker turn, so a caller is never quietly handed a
+    partial history that looks whole. ``include_archive=True`` is the full
+    record: the sidecar is read too and the marker is dropped, because with
+    both files in hand nothing is missing for it to mark. It costs the whole
+    history by definition, so it belongs to an export or a support dig, never
+    to a request path.
+    """
+    conv_dir = _conv_dir(user_id, conv_id)
+    path = conv_dir / TRANSCRIPT_FILENAME
+    archive = conv_dir / TRANSCRIPT_ARCHIVE_FILENAME
+
+    if limit:
+        turns: Iterator[TurnEntry] = _iter_turns_reverse(path)
+        if include_archive:
+            turns = (
+                turn
+                for turn in chain(turns, _iter_turns_reverse(archive))
+                if not _is_archive_marker(turn)
+            )
+        tail = list(islice(turns, limit))
+        tail.reverse()
+        return tail
+
+    if not include_archive:
+        return _read_turns(path)
+    return [
+        turn
+        for turn in chain(_read_turns(archive), _read_turns(path))
+        if not _is_archive_marker(turn)
+    ]
 
 
 def append_turn(user_id: int, conv_id: str, entry: TurnEntry) -> None:
@@ -381,6 +585,11 @@ def append_turn(user_id: int, conv_id: str, entry: TurnEntry) -> None:
         log.warning("Could not append turn to %s", conv_dir, exc_info=True)
         return
 
+    try:
+        _trim_transcript(conv_dir)
+    except Exception:  # noqa: BLE001 - retention must not break a live prompt
+        log.warning("Could not trim transcript for %s", conv_dir, exc_info=True)
+
     meta = get_conversation(user_id, conv_id)
     if meta is None:
         # The turn is on disk either way; without a meta there is nothing
@@ -394,6 +603,115 @@ def append_turn(user_id: int, conv_id: str, entry: TurnEntry) -> None:
     if entry.role == "assistant" and entry.text:
         fields["last_snippet"] = _truncate(entry.text, SNIPPET_MAX_CHARS)
     write_status(conv_dir, META_FILENAME, **fields)
+
+
+# ── Retention ──
+
+
+def _keep_bytes() -> int:
+    """How much of the newest transcript a trim has to leave behind."""
+    return max(TRANSCRIPT_KEEP_BYTES, REPLAY_MAX_CHARS * _REPLAY_HEADROOM)
+
+
+def _is_archive_marker(turn: TurnEntry) -> bool:
+    return turn.role == "system" and turn.kind == ARCHIVE_MARKER_KIND
+
+
+def _archived_count(line: bytes) -> int | None:
+    """Turns already archived according to ``line``; None if it is no marker.
+
+    A marker we cannot read the count out of returns 0 rather than None: it is
+    still a marker, so it must be replaced instead of kept as a turn, and
+    under-counting the total beats emitting two markers.
+    """
+    try:
+        data = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("kind") != ARCHIVE_MARKER_KIND:
+        return None
+    match = _ARCHIVE_MARKER_RE.match(str(data.get("text") or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _archive_marker(count: int) -> bytes:
+    entry = TurnEntry(
+        role="system",
+        kind=ARCHIVE_MARKER_KIND,
+        text=f"{count} older turns moved to {TRANSCRIPT_ARCHIVE_FILENAME}",
+    )
+    return json.dumps(entry.model_dump(mode="json"), ensure_ascii=False).encode("utf-8")
+
+
+def _append_archive(conv_dir: Path, lines: list[bytes]) -> None:
+    """Append retired turns to the sidecar, durably.
+
+    ``fsync``-ed before the caller republishes the live file, because until
+    this returns the live file is the only copy of these turns.
+    """
+    with (conv_dir / TRANSCRIPT_ARCHIVE_FILENAME).open("ab") as fh:
+        fh.write(b"\n".join(lines) + b"\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _trim_transcript(conv_dir: Path) -> None:
+    """Move the oldest turns of an oversized transcript into the sidecar.
+
+    Archive first, then republish the live file, so every crash window fails
+    safe. Before the archive write: the transcript is untouched. Between the
+    two: the moved turns exist in *both* files, and a duplicate in a sidecar
+    nobody reads on the hot path is a far better outcome than a hole in
+    someone's chat. During the republish: ``atomic_write_bytes`` publishes by
+    rename, so a reader sees the whole old file or the whole new one and a
+    crash leaves the old one intact — the trim simply happens again on the
+    next append. There is no ordering in which a turn is lost.
+
+    Whole lines only, and the newest turn is kept unconditionally: a single
+    turn larger than the entire budget has to shrink the file, not empty it.
+    """
+    path = conv_dir / TRANSCRIPT_FILENAME
+    try:
+        if path.stat().st_size <= TRANSCRIPT_MAX_BYTES:
+            return
+        raw = path.read_bytes()
+    except OSError:
+        log.debug("Could not read transcript for trimming at %s", path, exc_info=True)
+        return
+
+    lines = [line for line in raw.split(b"\n") if line.strip()]
+    if not lines:
+        return
+    archived = _archived_count(lines[0])
+    if archived is not None:
+        lines.pop(0)
+    if not lines:
+        return
+
+    budget = _keep_bytes()
+    cut = len(lines) - 1
+    kept = len(lines[-1]) + 1
+    for index in range(len(lines) - 2, -1, -1):
+        size = len(lines[index]) + 1
+        if kept + size > budget:
+            break
+        kept += size
+        cut = index
+
+    dropped, keep = lines[:cut], lines[cut:]
+    if not dropped:
+        return
+
+    try:
+        _append_archive(conv_dir, dropped)
+    except OSError:
+        # Nowhere safe to park them, so nothing moves: the file stays over the
+        # bound and the next append retries the trim.
+        log.warning("Could not archive turns for %s", conv_dir, exc_info=True)
+        return
+
+    marker = _archive_marker((archived or 0) + len(dropped))
+    atomic_write_bytes(path, b"\n".join([marker, *keep]) + b"\n")
 
 
 def update_meta(user_id: int, conv_id: str, **fields) -> bool:
@@ -458,9 +776,23 @@ def replay_context(
 
     Walks backwards from the newest turn so the most recent ones always survive
     the bound, then reverses. The returned string never exceeds ``max_chars``.
+
+    The walk reads the transcript backwards and parses lazily, so it stops at
+    the turn that overruns the budget instead of parsing the whole file first:
+    this runs on the session-spawn path.
+
+    Only the live transcript is read, never the archive, and retention is sized
+    so that is not a compromise: ``_keep_bytes()`` holds the tail at several
+    times ``REPLAY_MAX_CHARS``, so a trim can only ever remove turns this walk
+    had already stopped short of. The replay a resumed session receives is
+    therefore byte-identical before and after a trim. Where the replay does
+    stop is stated in the output itself, by the ``REPLAY_OMITTED`` footer —
+    which has always been the honest boundary here, since the budget cuts the
+    history long before retention does.
     """
-    turns = read_transcript(user_id, conv_id, limit=0)
-    if not turns:
+    turns = _iter_turns_reverse(_conv_dir(user_id, conv_id) / TRANSCRIPT_FILENAME)
+    newest_turn = next(turns, None)
+    if newest_turn is None:
         return ""
 
     # Budget the body so header and footer fit inside the caller's bound.
@@ -472,10 +804,13 @@ def replay_context(
     lines: list[str] = []
     used = 0
     omitted = False
-    for turn in reversed(turns):
+    newest = ""
+    for turn in chain([newest_turn], turns):
         rendered = _render_turn(turn)
         if not rendered:
             continue
+        if not newest:
+            newest = rendered
         if used + len(rendered) + 1 > budget:
             omitted = True
             break
@@ -485,7 +820,6 @@ def replay_context(
     if not lines:
         # Even the newest turn alone overruns the budget. Keeping a truncated
         # head of it beats returning nothing at all.
-        newest = next((r for r in (_render_turn(t) for t in reversed(turns)) if r), "")
         if not newest:
             return ""
         lines = [newest[:budget]]
@@ -525,11 +859,17 @@ class Recorder:
         *,
         agent_key: str = "",
         agent_slug: str = "",
+        user_kind: str = "",
     ):
         self.enabled = bool(conv_id) and user_id is not None
         self.user_id = user_id
         self.conv_id = conv_id
         self._user_text = user_text
+        # A turn nobody typed (a background task waking the chat, FEAT-034) is
+        # recorded as a system entry of this kind. Recording it as ``user``
+        # would put words in the user's mouth, and ``_render_turn`` would then
+        # replay them to the next session as something they said.
+        self._user_kind = user_kind
         # Keyword-only and defaulted: a caller that does not know who answered
         # records an unattributed turn instead of failing to record at all.
         self._agent_key = agent_key
@@ -605,9 +945,12 @@ class Recorder:
         _live_recorders.discard(self)
 
         try:
-            append_turn(
-                self.user_id, self.conv_id, TurnEntry(role="user", text=self._user_text)
+            opening = (
+                TurnEntry(role="system", text=self._user_text, kind=self._user_kind)
+                if self._user_kind
+                else TurnEntry(role="user", text=self._user_text)
             )
+            append_turn(self.user_id, self.conv_id, opening)
             text = "".join(self._text)
             tools = list(self._tools.values())
             if text or tools or self._thought:

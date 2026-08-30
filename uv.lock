@@ -635,7 +635,7 @@ dependencies = [
     { name = "watchfiles" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "black" },
     { name = "isort" },
@@ -648,13 +648,11 @@ dev = [
 requires-dist = [
     { name = "aiohttp" },
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
-    { name = "black", marker = "extra == 'dev'" },
     { name = "bleach", specifier = ">=6.4.0" },
     { name = "fastapi" },
     { name = "faster-whisper" },
     { name = "geckoterminal-py" },
-    { name = "hummingbot-api-client", specifier = "==1.5.6" },
-    { name = "isort", marker = "extra == 'dev'" },
+    { name = "hummingbot-api-client", git = "https://github.com/hummingbot/hummingbot-api-client.git?branch=feat%2Fclmm-bin-count" },
     { name = "kaleido" },
     { name = "markdown", specifier = ">=3.10.2" },
     { name = "matplotlib", specifier = ">=3.10.8" },
@@ -662,10 +660,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = "<1.24" },
     { name = "pandas" },
     { name = "plotly" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pydantic-ai", extras = ["mcp"] },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "python-dotenv" },
     { name = "python-jose", extras = ["cryptography"] },
     { name = "python-telegram-bot", extras = ["job-queue"] },
@@ -674,7 +669,15 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"] },
     { name = "watchfiles" },
 ]
-provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black" },
+    { name = "isort" },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
 
 [[package]]
 name = "contourpy"
@@ -1516,14 +1519,10 @@ wheels = [
 
 [[package]]
 name = "hummingbot-api-client"
-version = "1.5.6"
-source = { registry = "https://pypi.org/simple" }
+version = "1.5.8"
+source = { git = "https://github.com/hummingbot/hummingbot-api-client.git?branch=feat%2Fclmm-bin-count#ee667f2b107cb3d8d3e3a7b01160500cdb7a5c7c" }
 dependencies = [
     { name = "aiohttp" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/00/bd/4c0a9b857afedc2aeca245334610632f98dbe8ad5df6e262d501cd897173/hummingbot_api_client-1.5.6.tar.gz", hash = "sha256:88f8960b6f2b821d36e72a13e37297417d40293e60335f66b4c5c17cac4dfbd0", size = 39773, upload-time = "2026-08-03T21:50:28.863Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/ad/68034b1de34c4e99e063a9f384272b9a7a3298dbc241602ac224328e5a72/hummingbot_api_client-1.5.6-py3-none-any.whl", hash = "sha256:44806f9e358c55a24f30fc7f031c2b95e0569bece6bacaf0440d3a503576d07e", size = 46899, upload-time = "2026-08-03T21:50:27.584Z" },
 ]
 
 [[package]]

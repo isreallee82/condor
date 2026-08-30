@@ -36,6 +36,14 @@ _INTERACTIVE_SECTION_TYPES = {
 
 
 class ReportBuilder:
+    """Compose a report section by section, then ``save()`` it.
+
+    The one output surface a routine or a snippet renders through: KPIs,
+    tables, Plotly charts and prose accumulate on the builder and are written
+    as a single HTML report the dashboard can open. ``source(type, name)`` is
+    what files it under the producing routine.
+    """
+
     def __init__(self, title: str = "Report"):
         self._title = title
         self._source_type: str = ""
@@ -385,6 +393,11 @@ class ReportBuilder:
         charts_dir = store._charts_dir()
         charts_dir.mkdir(exist_ok=True)
         now = datetime.now(timezone.utc)
+        # A routine that never called .source() still gets the running routine's
+        # name, so it is findable on the Routines page (see store.default_source).
+        source_type, source_name = self._source_type, self._source_name
+        if not source_name:
+            source_type, source_name = store._report_source.get() or ("", "")
         sections_html = self._render_sections()
         interactive_sections = [
             section
@@ -402,10 +415,10 @@ class ReportBuilder:
             section["type"] in {"plotly", "chart"} for section in self._sections
         )
         meta_badges = ""
-        if self._source_type:
+        if source_type:
             meta_badges += (
-                f"<span>{html.escape(str(self._source_type))}: "
-                f"{html.escape(str(self._source_name))}</span>"
+                f"<span>{html.escape(str(source_type))}: "
+                f"{html.escape(str(source_name))}</span>"
             )
         for tag in self._tags:
             meta_badges += f"<span>#{html.escape(str(tag))}</span>"
@@ -451,10 +464,15 @@ class ReportBuilder:
                 "title": self._title,
                 "filename": filename,
                 "created_at": now.isoformat(),
-                "source_type": self._source_type,
-                "source_name": self._source_name,
+                "source_type": source_type,
+                "source_name": source_name,
                 "tags": self._tags,
                 "agent": store._report_agent.get() or "condor",
+                # The authenticated principal the run executes for (SEC-196):
+                # every runner wraps execution in store.attribute_owner, and the
+                # web routes authorize reads/deletes against this id. None (no
+                # wrapper, e.g. a bare script) makes the report admin-only.
+                "user_id": store._report_owner.get(),
             }
             entries = store._read_index()
             entries.append(entry)

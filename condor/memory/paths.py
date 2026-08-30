@@ -15,6 +15,13 @@ because "no agent bound" *means* Condor — a falsy slug resolves
 :data:`CHAT_SLUG`, so every existing ``SkillStore(None)`` / ``MemoryStore(uid,
 None)`` caller keeps landing where its data lives.
 
+Every path here hangs off :func:`condor.paths.agents_root`, the third root that
+module names — a *call*, never a module constant, so ``$CONDOR_AGENTS_ROOT`` is
+observable after import. That is what lets one autouse fixture keep the whole
+suite out of the developer's live memory and skill library; it used to take a
+per-module monkeypatch of a private name, which ten modules remembered and any
+eleventh could forget (CORR-220).
+
 Pure filesystem logic with **no** MCP/Telegram deps, so it runs from the main
 process (prompt injection) and from the MCP subprocess (the tools) alike.
 """
@@ -23,8 +30,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Anchor to the project root (…/condor) so paths are stable regardless of cwd.
-_PROJECT_ROOT = Path(__file__).parent.parent.parent
+from condor.paths import agents_root
 
 # The default agent: the one answering when no specialist is bound. It is a
 # normal agent directory like any other — what makes it default is that a falsy
@@ -34,7 +40,37 @@ CHAT_SLUG = "condor"
 
 def assistant_home(agent_slug: str | None = None) -> Path:
     """``agents/<slug>``; a falsy slug resolves the default agent (Condor)."""
-    return _PROJECT_ROOT / "agents" / (agent_slug or CHAT_SLUG)
+    return agents_root() / (agent_slug or CHAT_SLUG)
+
+
+def shared_skills_root() -> Path:
+    """The published skill library every assistant reads: ``agents/_shared/skills``.
+
+    Publication is the **directory**, not a frontmatter flag: a playbook in here
+    is global, one that isn't, isn't. That makes the boundary visible on disk and
+    makes leaking an unpublished playbook structurally impossible rather than a
+    check that must never be forgotten.
+
+    The ``_`` prefix keeps it out of the agent registry — ``AgentStore``'s
+    iterator skips ``_``-prefixed dirs, the same convention that already hides
+    ``agents/_defaults``. Only Condor may write here (see :class:`SkillStore`).
+    """
+    return agents_root() / "_shared" / "skills"
+
+
+def shared_routines_root() -> Path:
+    """The published routine library every assistant reads: ``agents/_shared/routines``.
+
+    The routine twin of :func:`shared_skills_root`, deliberately the same
+    convention: the directory *is* the publication flag (a Python module has no
+    frontmatter to carry one), only the chat writes here, and every agent reads
+    it *under* its own routines, which shadow it by name.
+
+    The ``_`` prefix keeps it out of the agent registry, so a shared routine
+    never surfaces as an agent-owned ``_shared/<name>`` — it is part of the
+    general library, un-prefixed. See :func:`routines.base.assistant_routines`.
+    """
+    return agents_root() / "_shared" / "routines"
 
 
 def store_root(user_id: int, agent_slug: str | None = None) -> Path:
@@ -73,7 +109,7 @@ def iter_user_stores(user_id: int) -> list[tuple[str, str | None, Path]]:
     if chat_root.exists():
         found.append((f"{CHAT_SLUG} (chat)", None, chat_root))
 
-    agents_dir = _PROJECT_ROOT / "agents"
+    agents_dir = agents_root()
     if agents_dir.exists():
         for d in sorted(agents_dir.iterdir()):
             if not d.is_dir() or d.name.startswith("_") or d.name == "strategies":

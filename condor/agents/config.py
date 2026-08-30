@@ -12,6 +12,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
+from condor.fsutil import atomic_write_text
+
 
 class RiskLimitsConfig(BaseModel):
     max_position_size_quote: float = Field(
@@ -44,6 +46,11 @@ class AgentConfig(BaseModel):
         description="Total capital budget for this session in quote currency",
     )
     frequency_sec: int = Field(default=60, description="Tick frequency in seconds")
+    tick_timeout_sec: int = Field(
+        default=0,
+        description="Wall-clock budget for one tick's agent session, in seconds; "
+        "0 = use the runtime default (10 min, or CONDOR_TIMEOUT_TICK_DEFAULT)",
+    )
     trading_context: str = Field(
         default="",
         description="Natural language session context that guides the agent's trading decisions",
@@ -66,6 +73,21 @@ class AgentConfig(BaseModel):
         description="auto = controller mode iff bot_name is set (default); "
         "bot = controller mode on, deriving bot_name as {agent_slug}-{strategy_slug} "
         "when empty; executors = force executor mode even with a bot_name set.",
+    )
+    canvas_enabled: bool = Field(
+        default=True,
+        description="Keep a session canvas (the agent's running narrative) and "
+        "publish a live session report. Costs ~1.2k input tokens per tick.",
+    )
+    canvas_nudge_ticks: int = Field(
+        default=12,
+        description="Remind the agent to revise its canvas after this many ticks "
+        "without a revision",
+    )
+    canvas_band_usd: float = Field(
+        default=25.0,
+        description="PnL drift since the last canvas revision that triggers a "
+        "revise-your-canvas nudge",
     )
     risk_limits: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
 
@@ -104,8 +126,9 @@ def save_agent_config(agent_dir: Path, config: AgentConfig) -> None:
     """Save config to config.yml in the agent directory."""
     config_path = agent_dir / "config.yml"
     agent_dir.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
-        yaml.dump(config.model_dump(), default_flow_style=False, sort_keys=False)
+    atomic_write_text(
+        config_path,
+        yaml.dump(config.model_dump(), default_flow_style=False, sort_keys=False),
     )
 
 
@@ -140,4 +163,6 @@ def save_full_config(agent_dir: Path, config: dict[str, Any]) -> None:
     """Save a raw config dict as YAML (no filtering through AgentConfig)."""
     config_path = agent_dir / "config.yml"
     agent_dir.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    atomic_write_text(
+        config_path, yaml.dump(config, default_flow_style=False, sort_keys=False)
+    )

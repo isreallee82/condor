@@ -15,17 +15,21 @@ import pytest
 from condor.acp.client import PromptDone, TextChunk
 from condor.runtime import PromptRequest, SessionKey, SessionSpec
 from condor.runtime import client as runtime
+from condor.runtime import conversations
 from condor.runtime import sessions as session_module
 from condor.runtime.conversations import (
     REDACTED,
     REPLAY_HEADER,
+    REPLAY_MAX_CHARS,
     REPLAY_OMITTED,
     TOOL_INPUT_MAX_CHARS,
     TOOL_OUTPUT_MAX_CHARS,
     ConversationIdError,
     Recorder,
     TurnEntry,
-    _root,
+    _conv_dir,
+    _iter_lines_reverse,
+    _render_turn,
     append_turn,
     delete_conversation,
     flush_all,
@@ -51,10 +55,13 @@ def conv_root(isolated_conversation_root):
     return isolated_conversation_root
 
 
-def test_root_is_derived_like_the_state_store(tmp_path, monkeypatch):
-    """The real path, unstubbed: same ``.runtime`` root ``state.py`` uses."""
-    monkeypatch.setattr("condor.agents.agent._DATA_ROOT", tmp_path / "agents")
-    assert _root() == tmp_path / "condor" / ".runtime" / "conversations"
+def test_a_conversation_lives_under_its_owner(conv_root):
+    """The user is the first path segment — see ``tests/runtime/test_paths.py``."""
+    meta = new_conversation(USER, WEB)
+
+    assert _conv_dir(USER, meta.id) == (
+        conv_root / str(USER) / "conversations" / meta.id
+    )
 
 
 # ── Lifecycle ──
@@ -66,7 +73,7 @@ def test_create_read_roundtrip(conv_root):
     assert meta.user_id == USER
     assert meta.surface == WEB
     assert meta.turn_count == 0
-    assert (conv_root / str(USER) / meta.id / "meta.json").is_file()
+    assert (conv_root / str(USER) / "conversations" / meta.id / "meta.json").is_file()
 
     loaded = get_conversation(USER, meta.id)
     assert loaded is not None
@@ -172,7 +179,7 @@ def test_long_title_is_truncated(conv_root):
 def test_a_corrupt_line_is_skipped_not_fatal(conv_root):
     meta = new_conversation(USER, WEB)
     append_turn(USER, meta.id, TurnEntry(role="user", text="one"))
-    path = conv_root / str(USER) / meta.id / "transcript.jsonl"
+    path = conv_root / str(USER) / "conversations" / meta.id / "transcript.jsonl"
     with path.open("a", encoding="utf-8") as fh:
         fh.write("{ this is not json\n")
         fh.write(json.dumps({"role": "assistant", "text": "two"}) + "\n")
@@ -187,7 +194,7 @@ def test_a_line_from_another_version_of_the_shape_still_parses(conv_root):
     unattributed, and a line carrying a key this build does not know is kept
     rather than dropped."""
     meta = new_conversation(USER, WEB)
-    path = conv_root / str(USER) / meta.id / "transcript.jsonl"
+    path = conv_root / str(USER) / "conversations" / meta.id / "transcript.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"role": "assistant", "text": "older build"}) + "\n")
@@ -496,7 +503,9 @@ def test_recorder_caps_tool_io(conv_root):
     assert "_clipped" in call["input"], "an oversized argument set stays a dict"
     assert len(call["input"]["_clipped"]) <= TOOL_INPUT_MAX_CHARS
 
-    written = (conv_root / str(USER) / meta.id / "transcript.jsonl").read_text()
+    written = (
+        conv_root / str(USER) / "conversations" / meta.id / "transcript.jsonl"
+    ).read_text()
     assert len(written) < 10_000, "the whole transcript stays small"
 
 
@@ -523,7 +532,9 @@ def test_recorder_does_not_persist_credentials_from_tool_arguments(conv_root):
     )
     rec.flush()
 
-    raw = (conv_root / str(USER) / meta.id / "transcript.jsonl").read_text()
+    raw = (
+        conv_root / str(USER) / "conversations" / meta.id / "transcript.jsonl"
+    ).read_text()
     assert "barabit" not in raw and "sk-live-123" not in raw
     call = read_transcript(USER, meta.id)[-1].tool_calls[0]
     assert call["input"]["password"] == REDACTED
@@ -670,10 +681,10 @@ class _ScriptedClient:
 @pytest.fixture
 def registry(monkeypatch, conv_root):
     monkeypatch.setattr(session_module, "_sessions", {})
-    monkeypatch.setattr(session_module, "ACPClient", _ScriptedClient)
+    monkeypatch.setattr("condor.acp.client.ACPClient", _ScriptedClient)
     monkeypatch.setattr(session_module, "build_initial_context", lambda *a, **k: "")
     monkeypatch.setattr(
-        "handlers.agents._shared.build_mcp_servers_for_session", lambda *a, **k: []
+        "condor.runtime.toolsets.build_mcp_servers_for_session", lambda *a, **k: []
     )
     _ScriptedClient.script = [
         TextChunk(text="the answer"),
@@ -962,3 +973,325 @@ def test_budget_still_refuses_when_every_session_is_busy(registry):
         return str(exc.value)
 
     assert "busy" in asyncio.run(scenario())
+
+
+# ── The LRU does not cross surfaces by surprise (CORR-227) ──
+
+
+class _RecordingBot:
+    """Stands in for the health monitor's Bot; records what it was told."""
+
+    def __init__(self):
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append((chat_id, text))
+
+
+async def _fill_with_one_telegram_session(web_slots: int) -> None:
+    """One (coldest) Telegram session plus ``web_slots`` warmer web ones."""
+    await runtime.create_session(
+        SessionSpec(
+            key=str(SessionKey.telegram(USER)),
+            agent_key="claude-code",
+            chat_id=USER,
+            user_id=USER,
+        )
+    )
+    for i in range(web_slots):
+        await runtime.create_session(
+            SessionSpec(
+                key=str(SessionKey.web(USER, f"slot{i}")),
+                agent_key="claude-code",
+                user_id=USER,
+            )
+        )
+        await _chat(SessionKey.web(USER, f"slot{i}"), "ping")
+
+
+def test_budget_prefers_a_victim_on_the_incoming_surface(registry):
+    """A new web tab detaches a web session, not the older Telegram chat.
+
+    The Telegram session here is the coldest of all — a global LRU would take
+    it, and the user would never see why: the tab bar shows only web.
+    """
+    cap = session_module.MAX_SESSIONS_PER_USER
+
+    async def scenario():
+        await _fill_with_one_telegram_session(cap - 1)
+        await runtime.create_session(
+            SessionSpec(
+                key=str(SessionKey.web(USER, "slot-new")),
+                agent_key="claude-code",
+                user_id=USER,
+            )
+        )
+
+    asyncio.run(scenario())
+
+    live = {i.key for i in asyncio.run(runtime.list_sessions(USER))}
+    assert len(live) == cap, "still at the cap, not over it"
+    assert str(SessionKey.web(USER, "slot-new")) in live
+    assert str(SessionKey.telegram(USER)) in live, "the unseen chat survived"
+    assert str(SessionKey.web(USER, "slot0")) not in live, "the coldest web tab went"
+
+
+def test_budget_crosses_surfaces_only_when_this_one_has_nothing_idle(
+    registry, monkeypatch
+):
+    """The cap is still a cap: with every web session busy, Telegram pays."""
+    cap = session_module.MAX_SESSIONS_PER_USER
+    bot = _RecordingBot()
+    monkeypatch.setattr(session_module, "_health_bot", bot)
+
+    async def scenario():
+        await _fill_with_one_telegram_session(cap - 1)
+        for session in session_module._sessions.values():
+            session.is_busy = session.key.surface == WEB
+
+        await runtime.create_session(
+            SessionSpec(
+                key=str(SessionKey.web(USER, "slot-new")),
+                agent_key="claude-code",
+                user_id=USER,
+            )
+        )
+
+    asyncio.run(scenario())
+
+    live = {i.key for i in asyncio.run(runtime.list_sessions(USER))}
+    assert len(live) == cap, "the cap is never breached to spare a surface"
+    assert str(SessionKey.web(USER, "slot-new")) in live
+    assert str(SessionKey.telegram(USER)) not in live, "the only idle one was taken"
+
+    assert len(bot.sent) == 1, "the chat that lost its session was told"
+    chat_id, text = bot.sent[0]
+    assert chat_id == USER
+    assert "detached" in text.lower()
+    assert "unexpectedly" not in text.lower(), "a detach is not the death notice"
+
+
+def test_a_same_surface_detach_stays_silent(registry, monkeypatch):
+    """No cross-surface surprise, no notice — the tab bar already showed it."""
+    bot = _RecordingBot()
+    monkeypatch.setattr(session_module, "_health_bot", bot)
+    cap = session_module.MAX_SESSIONS_PER_USER
+
+    async def scenario():
+        await _fill_with_one_telegram_session(cap - 1)
+        await runtime.create_session(
+            SessionSpec(
+                key=str(SessionKey.web(USER, "slot-new")),
+                agent_key="claude-code",
+                user_id=USER,
+            )
+        )
+
+    asyncio.run(scenario())
+
+    assert bot.sent == []
+
+
+# ── Bounded tail reads (PERF-138) ──
+
+
+def _replay_by_full_parse(user_id, conv_id, *, max_chars=None):
+    """The pre-PERF-138 replay: parse the whole file, then walk it backwards.
+
+    Kept verbatim as the oracle for the bounded reader — the point of the
+    change was cost, not output, so the two must agree line for line.
+    """
+    max_chars = REPLAY_MAX_CHARS if max_chars is None else max_chars
+    turns = read_transcript(user_id, conv_id, limit=0)
+    if not turns:
+        return ""
+    overhead = len(REPLAY_HEADER) + 1 + len(REPLAY_OMITTED) + 1
+    budget = max_chars - overhead
+    if budget <= 0:
+        return REPLAY_HEADER[:max_chars]
+
+    lines, used, omitted = [], 0, False
+    for turn in reversed(turns):
+        rendered = _render_turn(turn)
+        if not rendered:
+            continue
+        if used + len(rendered) + 1 > budget:
+            omitted = True
+            break
+        lines.append(rendered)
+        used += len(rendered) + 1
+
+    if not lines:
+        newest = next((r for r in (_render_turn(t) for t in reversed(turns)) if r), "")
+        if not newest:
+            return ""
+        lines = [newest[:budget]]
+        omitted = True
+
+    lines.reverse()
+    parts = [REPLAY_HEADER, *lines]
+    if omitted:
+        parts.append(REPLAY_OMITTED)
+    return "\n".join(parts)[:max_chars]
+
+
+def _write_raw_transcript(conv_root, conv_id, lines):
+    """Write transcript lines straight to disk, bypassing ``append_turn``."""
+    path = conv_root / str(USER) / "conversations" / conv_id / "transcript.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _turn_line(**fields):
+    return json.dumps(TurnEntry(**fields).model_dump(mode="json")) + "\n"
+
+
+def test_reverse_line_reader_matches_a_forward_read(conv_root):
+    """Backwards blocks yield exactly the forward lines, reversed.
+
+    Tiny blocks on purpose: every line here straddles a block boundary, which
+    is the only way the reader can lose or splice one.
+    """
+    meta = new_conversation(USER, WEB)
+    raw = ["one\n", "two\n", "\n", "three " + "x" * 500 + "\n", "four"]
+    path = _write_raw_transcript(conv_root, meta.id, raw)
+
+    forward = [line.strip() for line in path.read_bytes().split(b"\n") if line.strip()]
+    for block in (1, 7, 64, 4096):
+        assert (
+            list(_iter_lines_reverse(path, block=block)) == forward[::-1]
+        ), f"block={block} changed the line sequence"
+
+
+def test_replay_matches_the_full_parse_on_every_transcript_shape(conv_root):
+    """Same records, same order, same truncation boundary as the old path."""
+    shapes = {
+        "empty file": [],
+        "one turn": [_turn_line(role="user", text="hi")],
+        "short": [
+            _turn_line(role="user", text="what is my pnl?"),
+            _turn_line(role="assistant", text="Up $120."),
+        ],
+        "empty renders interleaved": [
+            _turn_line(role="assistant", text="", tool_calls=[]),
+            _turn_line(role="user", text="hello"),
+            _turn_line(role="system", text=""),
+            _turn_line(role="assistant", text="", tool_calls=[]),
+        ],
+        "malformed lines inside the tail": [
+            _turn_line(role="user", text="kept"),
+            "{not json at all\n",
+            _turn_line(role="assistant", text="also kept"),
+            '{"role": 12345}\n',
+        ],
+        "no trailing newline": [_turn_line(role="user", text="torn").rstrip("\n")],
+        "torn last line": [
+            _turn_line(role="user", text="whole"),
+            '{"role": "assistant", "text": "half a li',
+        ],
+        "long": [
+            _turn_line(role="user", text=f"message number {i} " + "x" * 100)
+            for i in range(300)
+        ],
+        "long with tool calls": [
+            _turn_line(
+                role="assistant",
+                text=f"turn {i}",
+                tool_calls=[{"id": f"t{i}", "title": "get_market_data"}],
+            )
+            for i in range(300)
+        ],
+        "one turn far over the bound": [_turn_line(role="user", text="y" * 5000)],
+    }
+
+    for name, raw in shapes.items():
+        meta = new_conversation(USER, WEB)
+        _write_raw_transcript(conv_root, meta.id, raw)
+        for max_chars in (10, 40, 200, 1000, REPLAY_MAX_CHARS):
+            assert replay_context(USER, meta.id, max_chars=max_chars) == (
+                _replay_by_full_parse(USER, meta.id, max_chars=max_chars)
+            ), f"{name} diverged from the full parse at max_chars={max_chars}"
+
+
+def _count_parsed_turns(monkeypatch):
+    """Count every ``TurnEntry`` the store builds while reading."""
+    real = conversations.TurnEntry
+    counter = {"n": 0}
+
+    def counting(**fields):
+        counter["n"] += 1
+        return real(**fields)
+
+    monkeypatch.setattr(conversations, "TurnEntry", counting)
+    return counter
+
+
+def test_replay_parses_a_bounded_tail_not_the_whole_transcript(conv_root, monkeypatch):
+    """The complexity pin: replay cost follows its char budget, not the file.
+
+    10k turns, ~200 chars each — the old path built 10k ``TurnEntry`` objects
+    to render a 1000-char tail. The bound here is the budget itself: no more
+    turns can be parsed than can fit in it, plus the one that overruns it.
+    """
+    meta = new_conversation(USER, WEB)
+    _write_raw_transcript(
+        conv_root,
+        meta.id,
+        [
+            _turn_line(role="user", text=f"message number {i} " + "x" * 200)
+            for i in range(10_000)
+        ],
+    )
+
+    counter = _count_parsed_turns(monkeypatch)
+    replay = replay_context(USER, meta.id, max_chars=1000)
+
+    assert "message number 9999" in replay
+    assert REPLAY_OMITTED in replay
+    assert counter["n"] <= 1000 // 200 + 2, (
+        "replay parsed more turns than its char budget can hold: "
+        f"{counter['n']} for a 1000-char tail of a 10k-turn transcript"
+    )
+
+
+def test_read_transcript_tail_parses_only_the_tail(conv_root, monkeypatch):
+    """The web route's ``limit=200`` over 10k turns parses 200, not 10k."""
+    meta = new_conversation(USER, WEB)
+    _write_raw_transcript(
+        conv_root,
+        meta.id,
+        [_turn_line(role="user", text=f"m{i}") for i in range(10_000)],
+    )
+
+    counter = _count_parsed_turns(monkeypatch)
+    tail = read_transcript(USER, meta.id, limit=200)
+
+    assert [t.text for t in tail] == [f"m{i}" for i in range(9800, 10_000)]
+    assert counter["n"] == 200, "a bounded read must not touch the older turns"
+
+
+def test_read_transcript_tail_skips_malformed_lines_like_the_full_read(conv_root):
+    """Tolerance is unchanged: a bad line costs its own slot, not the read."""
+    meta = new_conversation(USER, WEB)
+    _write_raw_transcript(
+        conv_root,
+        meta.id,
+        [
+            _turn_line(role="user", text="oldest"),
+            "not json\n",
+            _turn_line(role="assistant", text="middle"),
+            '{"role": "user", "text": {"bad": "type"}}\n',
+            _turn_line(role="user", text="newest"),
+        ],
+    )
+
+    assert [t.text for t in read_transcript(USER, meta.id, limit=2)] == [
+        "middle",
+        "newest",
+    ]
+    assert [t.text for t in read_transcript(USER, meta.id, limit=0)] == [
+        "oldest",
+        "middle",
+        "newest",
+    ]

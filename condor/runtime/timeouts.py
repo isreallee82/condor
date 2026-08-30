@@ -43,8 +43,16 @@ class TimeoutPolicy:
     sse_stream: int = 1800
     # Budget for one MCP tool call.
     mcp_call: float = 15.0
-    # Default budget for one strategy tick.
+    # Wall-clock budget for one agent session: a strategy tick's LLM turn, and
+    # the shutdown cleanup pass that runs under the same ceiling. 10 minutes.
     tick_default: int = 600
+    # How long a live session may sit unprompted before the health monitor
+    # detaches it. Every other deadline here bounds a *turn*; this one bounds a
+    # *session* — an abandoned chat holds an agent subprocess, the MCP tree it
+    # was spawned with, and one of the five per-user session slots, forever.
+    # The conversation is durable (FEAT-015), so this is a detach, not a loss.
+    # 0 disables the sweep. 1 hour.
+    session_idle: int = 3600
 
     @classmethod
     def load(cls) -> "TimeoutPolicy":
@@ -78,15 +86,16 @@ def resolve_tick_timeout(
     caller: int | None = None,
     strategy: int | None = None,
 ) -> int:
-    """Pick a tick budget: explicit caller override > strategy config > default.
+    """Pick an agent-session budget: caller override > run config > policy.
 
-    A single-tick run (dry run / run once) is a human waiting on a result, so it
-    gets the shorter default; a loop tick is unattended and may take longer.
+    ``strategy`` is the run's ``tick_timeout_sec``; 0 or None means "no opinion",
+    which falls through to ``tick_default`` (10 min, or CONDOR_TIMEOUT_TICK_DEFAULT).
+    ``execution_mode`` is accepted so a future policy can price attended runs
+    (dry_run / run_once) differently from unattended loops; today they share one
+    budget, and saying so here beats a branch that pretends otherwise.
     """
     if caller:
         return int(caller)
     if strategy:
         return int(strategy)
-    if execution_mode in ("dry_run", "run_once"):
-        return TIMEOUTS.tick_default
     return TIMEOUTS.tick_default

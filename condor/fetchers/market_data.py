@@ -9,15 +9,27 @@ logger = logging.getLogger(__name__)
 
 
 async def fetch_current_price(
-    client, connector_name: str, trading_pair: str, **_kw
+    client,
+    connector_name: str = "",
+    trading_pair: str = "",
+    strict: bool = False,
+    **_kw,
 ) -> Optional[float]:
-    """Fetch current price for a trading pair."""
+    """Fetch current price for a trading pair.
+
+    Args:
+        strict: Re-raise a failed request instead of degrading to None. The SDS
+            registration wants the raise so a transient failure keeps the last
+            good cached price instead of caching (and broadcasting) None.
+    """
     try:
         prices = await client.market_data.get_prices(
             connector_name=connector_name, trading_pairs=trading_pair
         )
         return prices.get("prices", {}).get(trading_pair)
     except Exception as e:
+        if strict:
+            raise
         logger.warning("Error fetching price for %s: %s", trading_pair, e)
         return None
 
@@ -40,8 +52,7 @@ async def fetch_candles(
         )
         if not candles:
             return None
-        data = candles if isinstance(candles, list) else candles.get("data", [])
-        if not data:
+        if not _unwrap_candles(candles):
             return None
         return candles
     except Exception as e:
@@ -49,6 +60,156 @@ async def fetch_candles(
             "Error fetching candles for %s: %s", trading_pair, e, exc_info=True
         )
         return None
+
+
+def normalize_candle(c: Any, *, strict: bool = False) -> Optional[Dict[str, float]]:
+    """Normalize one candle row to a dict of floats, or None when unusable.
+
+    The API returns candles in two shapes depending on endpoint and version: a
+    dict keyed by OHLCV names, or a positional row ``[ts, o, h, l, c, v]``
+    (extra trailing fields are ignored). Rows in neither shape yield None.
+
+    Args:
+        strict: Re-raise ``TypeError``/``ValueError`` from a malformed value
+            (e.g. ``open="n/a"``) instead of dropping the row. No candle caller
+            asks for this today — every one of them would rather lose a candle
+            than a whole series (see CORR-168) — but the raise stays available
+            for a consumer that cannot tolerate a hole.
+    """
+    try:
+        if isinstance(c, dict):
+            return {
+                "timestamp": float(c.get("timestamp", 0)),
+                "open": float(c.get("open", 0)),
+                "high": float(c.get("high", 0)),
+                "low": float(c.get("low", 0)),
+                "close": float(c.get("close", 0)),
+                "volume": float(c.get("volume", 0)),
+            }
+        if isinstance(c, (list, tuple)) and len(c) >= 6:
+            return {
+                "timestamp": float(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            }
+    except (TypeError, ValueError):
+        if strict:
+            raise
+    return None
+
+
+def _unwrap_candles(result: Any) -> List[Any]:
+    """Candle rows out of either payload shape: a bare list or ``{"data": [...]}``."""
+    return (
+        result
+        if isinstance(result, list)
+        else result.get("data", []) if isinstance(result, dict) else []
+    )
+
+
+async def fetch_historical_candles(
+    client,
+    connector_name: str,
+    trading_pair: str,
+    interval: str = "1m",
+    *,
+    start_time: Optional[int] = None,
+    end_time: Optional[int] = None,
+    limit: Optional[int] = None,
+    fallback_on_error: bool = False,
+    strict: bool = False,
+) -> List[Dict[str, float]]:
+    """Time-ranged candles, normalized, with the ``get_candles`` fallback ladder.
+
+    Owns the sequence every candle consumer used to inline: ask for the historical
+    range, unwrap whichever payload shape came back, fall back to the plain
+    ``get_candles`` window when the range yields nothing, and normalize the rows.
+
+    Args:
+        start_time / end_time: Unix epoch seconds. With ``start_time`` None the
+            historical call is skipped entirely and the fallback (if any) answers.
+        limit: Row count for the ``get_candles`` fallback. None disables the
+            fallback — for pollers that only want the fresh tail of a live range
+            and would rather return nothing than a full unrelated window.
+        fallback_on_error: Treat a failing historical call as an empty result and
+            continue to the fallback, instead of propagating. Callers that abort
+            on failure (WS backfill, REST poll) leave it off.
+        strict: Passed through to `normalize_candle`. Rows dropped instead of
+            raised are logged once per call at warning, so a payload bug is
+            still discoverable rather than silently thinning the series.
+
+    Returns:
+        Normalized candles in upstream order; empty when nothing was usable.
+    """
+    result = None
+    if start_time is not None:
+        try:
+            logger.info(
+                "Fetching historical candles: connector=%s pair=%s interval=%s "
+                "start=%s end=%s",
+                connector_name,
+                trading_pair,
+                interval,
+                start_time,
+                end_time,
+            )
+            result = await client.market_data.get_historical_candles(
+                connector_name,
+                trading_pair,
+                interval,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except Exception as e:
+            if not fallback_on_error:
+                raise
+            logger.warning(
+                "get_historical_candles failed: %s — falling back to get_candles", e
+            )
+            result = None
+
+    rows = _unwrap_candles(result)
+    if not rows and limit is not None:
+        logger.info(
+            "Falling back to get_candles: connector=%s pair=%s interval=%s limit=%s",
+            connector_name,
+            trading_pair,
+            interval,
+            limit,
+        )
+        result = await client.market_data.get_candles(
+            connector_name, trading_pair, interval, limit
+        )
+        rows = _unwrap_candles(result)
+
+    normalized: List[Dict[str, float]] = []
+    dropped: List[Any] = []
+    for r in rows:
+        c = normalize_candle(r, strict=strict)
+        if c is None:
+            dropped.append(r)
+        else:
+            normalized.append(c)
+
+    if dropped:
+        # A dropped row leaves a hole in the series that consumers cannot tell
+        # apart from a genuine gap in upstream data, so keep it discoverable.
+        # One line per fetch, not per bad row: a systematically broken payload
+        # would otherwise flood the log from the WS pollers.
+        logger.warning(
+            "Dropped %d of %d unusable candle rows for %s %s %s; first: %r",
+            len(dropped),
+            len(rows),
+            connector_name,
+            trading_pair,
+            interval,
+            dropped[0],
+        )
+
+    return normalized
 
 
 async def fetch_candle_connectors(client, **_kw) -> List[str]:
@@ -124,7 +285,9 @@ def _usd_rate(quote: str, prices: Dict[str, float]) -> Optional[float]:
 
 
 def _normalize_tickers(
-    raw: Dict[str, Any], prices: Dict[str, float]
+    raw: Dict[str, Any],
+    prices: Dict[str, float],
+    rate_cache: Optional[Dict[str, Optional[float]]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], float]:
     """Normalize one connector's raw tickers, adding `usd_volume`.
 
@@ -132,10 +295,17 @@ def _normalize_tickers(
     BTC-quoted pairs aren't comparable with USDT-quoted ones. Each quote asset is
     priced off `prices` — no extra API call.
 
+    Args:
+        rate_cache: Quote → USD rate memo. `_usd_rate` is pure in `(quote, prices)`
+            and its misses are O(pool), so callers normalizing several connectors
+            off the *same* `prices` pool should hand in one shared dict. Omit it
+            (a fresh memo per call) whenever `prices` differs between calls.
+
     Returns:
         ({pair: {price, base_volume, quote_volume, usd_volume}}, latest_timestamp)
     """
-    rate_cache: Dict[str, Optional[float]] = {}
+    if rate_cache is None:
+        rate_cache = {}
     tickers: Dict[str, Dict[str, Any]] = {}
     latest_ts = 0.0
 
@@ -167,7 +337,7 @@ def _normalize_tickers(
     return tickers, latest_ts
 
 
-async def fetch_ticker_pool(client, **_kw) -> Dict[str, Any]:
+async def fetch_ticker_pool(client, strict: bool = False, **_kw) -> Dict[str, Any]:
     """Fetch the API's whole ticker pool in a single call.
 
     Without a `connectors` filter the endpoint is a plain read of the pool the API
@@ -175,6 +345,12 @@ async def fetch_ticker_pool(client, **_kw) -> Dict[str, Any]:
     cheap enough to poll. Condor caches the result (see `ServerDataType.TICKER_POOL`)
     and serves both per-connector tickers and currency conversion from it, instead of
     hitting `/market-data/tickers` and `/market-data/rates` per request.
+
+    Args:
+        strict: Re-raise a failed request instead of degrading to the empty pool,
+            so the SDS keeps the last good pool and backs off. A 404 ("server has
+            no tickers endpoint") stays an empty pool even in strict mode — that
+            is a real answer, not a failure (mirrors `fetch_rates`).
 
     Returns:
         {
@@ -190,8 +366,10 @@ async def fetch_ticker_pool(client, **_kw) -> Dict[str, Any]:
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
             logger.debug("Server has no /market-data/tickers endpoint: %s", e)
-        else:
-            logger.warning("Error fetching ticker pool: %s", e)
+            return empty
+        if strict:
+            raise
+        logger.warning("Error fetching ticker pool: %s", e)
         return empty
 
     raw_by_connector = (result or {}).get("tickers") or {}
@@ -203,10 +381,13 @@ async def fetch_ticker_pool(client, **_kw) -> Dict[str, Any]:
 
     connectors: Dict[str, Dict[str, Any]] = {}
     updated_at: Dict[str, Optional[float]] = {}
+    # One memo for the whole pool: `prices` is the same merged map for every
+    # connector, so a quote resolved once never needs resolving again.
+    rate_cache: Dict[str, Optional[float]] = {}
     for connector, raw in raw_by_connector.items():
         if not isinstance(raw, dict):
             continue
-        tickers, latest_ts = _normalize_tickers(raw, prices)
+        tickers, latest_ts = _normalize_tickers(raw, prices, rate_cache)
         connectors[connector] = tickers
         # `updated_at` is absent on older API versions — fall back to ticker timestamps.
         updated_at[connector] = (
@@ -218,12 +399,20 @@ async def fetch_ticker_pool(client, **_kw) -> Dict[str, Any]:
     return {"connectors": connectors, "prices": prices, "updated_at": updated_at}
 
 
-async def fetch_tickers(client, connector_name: str = "", **_kw) -> Dict[str, Any]:
+async def fetch_tickers(
+    client, connector_name: str = "", strict: bool = False, **_kw
+) -> Dict[str, Any]:
     """Fetch 24h tickers (price + volumes) for a single connector.
 
     Fallback for connectors that aren't in the cached pool yet: naming the connector
     makes the API fetch it on demand and enroll it in its background refresh cycle,
     so subsequent pool reads include it. Prefer `fetch_ticker_pool` where possible.
+
+    Args:
+        strict: Re-raise a failed request instead of degrading to empty tickers,
+            so the SDS keeps the last good value and backs off. A 404 ("server
+            has no tickers endpoint") stays a real empty answer even in strict
+            mode (mirrors `fetch_ticker_pool`).
 
     Returns:
         {"tickers": {pair: {price, base_volume, quote_volume, usd_volume}}, "updated_at": float|None}
@@ -241,8 +430,10 @@ async def fetch_tickers(client, connector_name: str = "", **_kw) -> Dict[str, An
                 connector_name,
                 e,
             )
-        else:
-            logger.warning("Error fetching tickers for %s: %s", connector_name, e)
+            return {"tickers": {}, "updated_at": None}
+        if strict:
+            raise
+        logger.warning("Error fetching tickers for %s: %s", connector_name, e)
         return {"tickers": {}, "updated_at": None}
 
     raw = ((result or {}).get("tickers") or {}).get(connector_name) or {}

@@ -1,8 +1,10 @@
 """Per-file JSON persistence for backtest results.
 
-Each backtest is stored as an individual JSON file under data/backtests/.
-A lightweight index (_index.json) tracks task_id -> server mapping for fast listing.
+Each backtest is stored as an individual JSON file under
+:func:`condor.paths.backtests_dir`. A lightweight index (_index.json) tracks
+task_id -> server mapping for fast listing.
 """
+
 from __future__ import annotations
 
 import json
@@ -10,20 +12,25 @@ import logging
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from condor import paths
+from condor.fsutil import atomic_write_json
 
-_DATA_DIR = Path("data") / "backtests"
-_INDEX_FILE = _DATA_DIR / "_index.json"
-_LEGACY_FILE = Path("data") / "backtests.json"
+logger = logging.getLogger(__name__)
 
 
 class BacktestStore:
     """Persist backtest results to individual JSON files."""
 
-    def __init__(self, data_dir: Path = _DATA_DIR) -> None:
+    def __init__(self, data_dir: Path | None = None) -> None:
+        # Resolved here rather than as a default argument: a default binds the
+        # directory at import, which is exactly the cwd-relative constant this
+        # replaced, and $CONDOR_DATA_DIR has to stay observable after import.
+        data_dir = paths.backtests_dir() if data_dir is None else Path(data_dir)
         self._dir = data_dir
         self._index_path = data_dir / "_index.json"
-        self._index: dict[str, dict[str, str]] = {}  # task_id -> {server, ...light meta}
+        self._index: dict[str, dict[str, str]] = (
+            {}
+        )  # task_id -> {server, ...light meta}
         self._dir.mkdir(parents=True, exist_ok=True)
         self._load_index()
         self._migrate_legacy()
@@ -76,29 +83,24 @@ class BacktestStore:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             logger.warning("Failed to read backtest file %s", path)
             return None
 
     def _write_file(self, task_id: str, data: dict[str, Any]) -> None:
-        path = self._task_path(task_id)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(path)
+        atomic_write_json(self._task_path(task_id), data)
 
     def _load_index(self) -> None:
         if self._index_path.exists():
             try:
-                self._index = json.loads(self._index_path.read_text())
+                self._index = json.loads(self._index_path.read_text(encoding="utf-8"))
             except Exception:
                 logger.warning("Failed to load backtest index, rebuilding")
                 self._rebuild_index()
 
     def _persist_index(self) -> None:
-        tmp = self._index_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._index))
-        tmp.replace(self._index_path)
+        atomic_write_json(self._index_path, self._index)
 
     def _rebuild_index(self) -> None:
         """Rebuild index from individual files on disk."""
@@ -107,11 +109,15 @@ class BacktestStore:
             if path.name == "_index.json":
                 continue
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 task_id = path.stem
                 self._index[task_id] = {
                     "server": data.get("server", ""),
-                    "config": data.get("config", {}).get("id", "") if isinstance(data.get("config"), dict) else "",
+                    "config": (
+                        data.get("config", {}).get("id", "")
+                        if isinstance(data.get("config"), dict)
+                        else ""
+                    ),
                 }
             except Exception:
                 logger.warning("Skipping corrupt backtest file %s", path)
@@ -119,24 +125,31 @@ class BacktestStore:
 
     def _migrate_legacy(self) -> None:
         """Migrate from single backtests.json to per-file storage."""
-        if not _LEGACY_FILE.exists():
+        legacy_file = paths.legacy_backtests_file()
+        if not legacy_file.exists():
             return
         try:
-            legacy_data = json.loads(_LEGACY_FILE.read_text())
+            legacy_data = json.loads(legacy_file.read_text(encoding="utf-8"))
             if not isinstance(legacy_data, dict) or not legacy_data:
-                _LEGACY_FILE.unlink()
+                legacy_file.unlink()
                 return
-            logger.info("Migrating %d backtest results from legacy store", len(legacy_data))
+            logger.info(
+                "Migrating %d backtest results from legacy store", len(legacy_data)
+            )
             for task_id, entry in legacy_data.items():
                 server = entry.pop("server", "")
                 self._write_file(task_id, {"server": server, **entry})
                 self._index[task_id] = {
                     "server": server,
-                    "config": entry.get("config", {}).get("id", "") if isinstance(entry.get("config"), dict) else "",
+                    "config": (
+                        entry.get("config", {}).get("id", "")
+                        if isinstance(entry.get("config"), dict)
+                        else ""
+                    ),
                 }
             self._persist_index()
             # Remove legacy file after successful migration
-            _LEGACY_FILE.unlink()
+            legacy_file.unlink()
             logger.info("Legacy backtest store migrated and removed")
         except Exception:
             logger.warning("Failed to migrate legacy backtest store", exc_info=True)

@@ -6,9 +6,10 @@ import asyncio
 import contextvars
 import json
 import os
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+from condor.fsutil import atomic_write_json, atomic_write_text
 
 # reports/ is a repository-root output directory, not this source package.
 CHARTS_DIR = Path(__file__).resolve().parents[2] / "reports"
@@ -21,6 +22,12 @@ _last_report_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _report_agent: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "report_agent", default=None
+)
+_report_source: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "report_source", default=None
+)
+_report_owner: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "report_owner", default=None
 )
 
 
@@ -58,6 +65,82 @@ def attribute_to(agent: str | None):
         _report_agent.reset(token)
 
 
+def current_agent() -> str | None:
+    """The assistant reports are currently attributed to, if any.
+
+    Read by the nested ``call_routine`` runner: a nested run executes in its own
+    copy of the caller's context, so the caller's ``attribute_to`` is still in
+    scope here, and the inner routine can inherit the assistant that asked
+    instead of falling back to its own library owner (ARCH-217).
+    """
+    return _report_agent.get()
+
+
+@contextmanager
+def attribute_owner(user_id: int | None):
+    """Attribute reports saved within this block to an authenticated user id.
+
+    Every runner (routine store, code runner, Telegram routine handler, agent
+    session report) wraps execution with this so ``ReportBuilder.save`` records
+    who the report belongs to — the id the web routes then authorize reads and
+    deletes against (SEC-196). A falsy id (0, None) records no owner, which the
+    routes treat as admin-only, never world-readable.
+    """
+    token = _report_owner.set(int(user_id) if user_id else None)
+    try:
+        yield
+    finally:
+        _report_owner.reset(token)
+
+
+@contextmanager
+def default_source(source_type: str, source_name: str):
+    """Stamp reports saved in this block that never called ``ReportBuilder.source()``.
+
+    Without a source a report is invisible on the Routines page: the per-routine
+    list matches on ``source_name`` and ``list_reports_grouped`` skips entries
+    without one, so a routine that forgot the call showed "No reports yet" while
+    the report existed. The routine runner wraps every run with this so the
+    call is a nicety, not a requirement. An explicit ``source()`` always wins.
+    """
+    value = (source_type, source_name) if source_name else None
+    token = _report_source.set(value)
+    try:
+        yield
+    finally:
+        _report_source.reset(token)
+
+
+@contextmanager
+def run_scope(
+    *,
+    owner: int | None = None,
+    agent: str | None = None,
+    source_type: str = "",
+    source_name: str = "",
+):
+    """The report-attribution scope every runner of user code enters.
+
+    One block, four effects: the last-report id is reset so the run reports only
+    what *it* saved, and reports saved inside are stamped with the owner allowed
+    to read them (SEC-196), the assistant that asked, and a fallback source that
+    keeps them visible on the Routines page. The routine store, the code runner,
+    the nested ``call_routine`` runner and both Telegram runners enter it here
+    instead of hand-copying the four calls, which had already drifted apart once
+    (ARCH-217).
+
+    ``bind_context`` stays at the call site: each runner publishes a different
+    context object, and ``condor.reports`` must not import ``condor.primitives``.
+    """
+    reset_last_report_id()
+    with (
+        attribute_owner(owner),
+        attribute_to(agent),
+        default_source(source_type, source_name),
+    ):
+        yield
+
+
 def get_report_raw_html(report_id: str) -> tuple[str, str] | None:
     """Return the report's raw HTML and filename exactly as saved on disk.
 
@@ -91,45 +174,12 @@ def _read_index() -> list[dict]:
 
 
 def _write_index(entries: list[dict]) -> None:
-    charts_dir = _charts_dir()
-    charts_dir.mkdir(exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(charts_dir), suffix=".tmp", delete=False
-    )
-    try:
-        json.dump(entries, tmp, indent=2, ensure_ascii=False)
-        tmp.close()
-        os.replace(tmp.name, str(_index_file()))
-    except Exception:
-        tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(_index_file(), entries, indent=2, ensure_ascii=False)
 
 
 def _write_report_html(path: Path, content: str) -> None:
     """Atomically create or replace a report HTML file."""
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    )
-    try:
-        tmp.write(content)
-        tmp.close()
-        os.replace(tmp.name, path)
-    except Exception:
-        tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content)
 
 
 def list_reports(
@@ -139,10 +189,21 @@ def list_reports(
     agent: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    owner_id: int | None = None,
 ) -> tuple[list[dict], int]:
+    """List index entries, newest first.
+
+    ``owner_id`` scopes the listing to one user's reports: entries whose
+    ``user_id`` differs — including legacy entries with no owner at all —
+    are dropped (fail closed, SEC-196). ``None`` means no owner filter,
+    which the web routes reserve for admins; internal callers that match
+    on ``source_name`` (routine run lists) also pass ``None``.
+    """
     entries = _read_index()
     entries.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
 
+    if owner_id is not None:
+        entries = [entry for entry in entries if entry.get("user_id") == owner_id]
     if source_type:
         entries = [
             entry for entry in entries if entry.get("source_type") == source_type
@@ -165,10 +226,16 @@ def list_reports(
     return entries[offset : offset + limit], total
 
 
-def list_reports_grouped() -> list[dict]:
-    """Return the latest report per source name, with count."""
+def list_reports_grouped(owner_id: int | None = None) -> list[dict]:
+    """Return the latest report per source name, with count.
+
+    ``owner_id`` scopes the grouping exactly as in ``list_reports``: ``None``
+    (admin) sees every entry, anyone else only entries stamped with their id.
+    """
     entries = _read_index()
     entries.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+    if owner_id is not None:
+        entries = [entry for entry in entries if entry.get("user_id") == owner_id]
     groups: dict[str, dict] = {}
     for entry in entries:
         source_name = entry.get("source_name", "")
@@ -195,6 +262,7 @@ def list_reports_grouped() -> list[dict]:
 
 
 def get_report(report_id: str) -> dict | None:
+    """Return one report's index entry, or None when no report has that id."""
     for entry in _read_index():
         if entry["id"] == report_id:
             return entry
@@ -202,6 +270,7 @@ def get_report(report_id: str) -> dict | None:
 
 
 async def delete_report(report_id: str) -> bool:
+    """Delete a report's HTML and its index entry. True when one was removed."""
     async with _index_lock:
         entries = _read_index()
         new_entries = []

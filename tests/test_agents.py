@@ -312,12 +312,10 @@ def test_routines_dir_resolves_bare_agent_slug(tmp_path, monkeypatch):
 # ── Shared per-Agent skill library (FEAT-003 brain) ──
 
 
-def test_agent_skill_library_read_and_edit(tmp_path, monkeypatch):
+def test_agent_skill_library_read_and_edit(tmp_path):
     """An Agent's skills/<slug>/SKILL.md library is readable and editable."""
-    from condor.memory import paths as paths_module
     from condor.memory.skills import SkillStore
 
-    monkeypatch.setattr(paths_module, "_PROJECT_ROOT", tmp_path)
     skill_dir = tmp_path / "agents" / "executor_manager" / "skills" / "size_grid"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -544,11 +542,11 @@ def _run_create_session(monkeypatch, *, chat_id, user_id):
     from condor.runtime import sessions as session_module
 
     monkeypatch.setattr(session_module, "_sessions", {})
-    monkeypatch.setattr(session_module, "ACPClient", _FakeACPClient)
+    monkeypatch.setattr("condor.acp.client.ACPClient", _FakeACPClient)
     monkeypatch.setattr(session_module, "build_initial_context", lambda *a, **k: "")
     # Resolved through condor.runtime.binding now, so patch it at the source.
     monkeypatch.setattr(
-        "handlers.agents._shared.build_mcp_servers_for_session", lambda *a, **k: []
+        "condor.runtime.toolsets.build_mcp_servers_for_session", lambda *a, **k: []
     )
     _FakeACPClient.last_extra_env = None
     spec = SessionSpec(
@@ -649,8 +647,7 @@ def test_consult_denies_server_without_access(monkeypatch):
 
     monkeypatch.setattr(consult_module, "run_consult", _fail_run_consult)
     monkeypatch.setattr(
-        config_manager,
-        "get_config_manager",
+        "condor.web.auth.get_config_manager",
         lambda: SimpleNamespace(has_server_access=lambda uid, name: False),
     )
 
@@ -679,8 +676,7 @@ def test_consult_forces_caller_user_id(monkeypatch):
 
     monkeypatch.setattr(consult_module, "run_consult", _capture_run_consult)
     monkeypatch.setattr(
-        config_manager,
-        "get_config_manager",
+        "condor.web.auth.get_config_manager",
         lambda: SimpleNamespace(has_server_access=lambda uid, name: True),
     )
 
@@ -721,3 +717,52 @@ def test_session_mcp_servers_carry_agent_slug(monkeypatch):
     servers = build_mcp_servers_for_session(42, 42)
     condor = next(s for s in servers if s["name"] == "condor")
     assert "--agent-slug" not in condor["args"]
+
+
+def test_numeric_credentials_reach_the_subprocess_as_strings(monkeypatch):
+    """YAML ``password: 123`` loads as int; spawning an MCP subprocess needs str.
+
+    The credentials ride the ``env`` channel rather than argv (SEC-095), so both
+    channels are checked: an int anywhere in the args list or the env mapping
+    trips pydantic-ai's StdioServerParameters validation, which is why this only
+    ever surfaced on the lmstudio:/ollama:/openrouter: backends.
+    """
+    import config_manager
+    from handlers.agents._shared import build_mcp_servers_for_session
+
+    class _NumericPasswordServer:
+        def get_accessible_servers(self, user_id):
+            return ["local"]
+
+        def has_server_access(self, user_id, name, permission=None):
+            return True
+
+        def get_server(self, name):
+            return {
+                "host": "localhost",
+                "port": 8000,
+                "username": 999,
+                "password": 123,
+            }
+
+        def has_server_access(self, user_id, server_name, *args, **kwargs):
+            # SEC-178: the resolver holds every candidate to reach, not just
+            # existence. This double owns the server it hands out.
+            return True
+
+    monkeypatch.setattr(
+        config_manager, "get_config_manager", lambda: _NumericPasswordServer()
+    )
+    monkeypatch.setattr(config_manager, "get_effective_server", lambda *a, **k: "local")
+
+    servers = build_mcp_servers_for_session(42, 42)
+    for server in servers:
+        assert all(isinstance(a, str) for a in server["args"]), server["name"]
+        for entry in server["env"]:
+            assert isinstance(entry["name"], str)
+            assert isinstance(entry["value"], str), f"{server['name']}/{entry['name']}"
+
+    hb = next(s for s in servers if s["name"] == "mcp-hummingbot")
+    env = {e["name"]: e["value"] for e in hb["env"]}
+    assert env["HUMMINGBOT_API_USERNAME"] == "999"
+    assert env["HUMMINGBOT_API_PASSWORD"] == "123"

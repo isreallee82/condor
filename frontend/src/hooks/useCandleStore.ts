@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { CandleData } from "@/lib/api";
-import { candleStore } from "@/lib/candle-store";
+import { candleChannelKey, candleStore } from "@/lib/candle-store";
 
 /** Staleness thresholds by interval category */
 const STALE_THRESHOLD_SUB_1H_MS = 30_000; // 30s for intervals < 1h
@@ -25,15 +25,20 @@ export function useCandleStore(
   connector: string,
   pair: string,
   interval: string,
+  /**
+   * Pin the stream to one DEX pool. A gateway pair like `SOL-USDC` exists in
+   * dozens of pools, and without this the backend charts whichever one it judges
+   * deepest — which is exactly the guess the DEX page exists to overturn. Omitted
+   * (every CLOB chart) the channel keeps its five segments, byte for byte.
+   */
+  poolAddress?: string,
 ): {
   candles: CandleData[];
   isStale: boolean;
   mergeCandles: (c: CandleData[]) => void;
   setDuration: (seconds: number) => void;
 } {
-  const key = server
-    ? `candles:${server}:${connector}:${pair}:${interval}`
-    : "";
+  const key = server ? candleChannelKey(server, connector, pair, interval, poolAddress) : "";
 
   const [candles, setCandles] = useState<CandleData[]>([]);
   const [isStale, setIsStale] = useState(false);
@@ -48,11 +53,13 @@ export function useCandleStore(
 
     keyRef.current = key;
 
-    // Subscribe — returns cached candles instantly
+    // Subscribe — returns cached candles instantly, or [] for a cold channel.
+    // Written unconditionally: retaining the previous key's candles here would
+    // leak one market's prices into another for callers that are not remounted
+    // on a pair change (CreateExecutor's `currentPrice`, for one).
     const cached = candleStore.subscribe(key);
-    if (cached.length > 0) {
-      setCandles(cached);
-    }
+    setCandles(cached);
+    setIsStale(false); // freshly subscribed; the periodic check re-evaluates below
 
     // Listen for updates
     const removeListener = candleStore.onUpdate(key, (updated) => {

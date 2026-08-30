@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ConversationTurn } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  api,
+  type AppNotification,
+  type ConversationTurn,
+  type NotificationsResponse,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { toolCallState } from "@/lib/formatters";
 import { getViewContext } from "@/lib/viewContext";
@@ -18,7 +24,7 @@ export interface ChatMessage {
   text: string;
   toolCalls: ToolCall[];
   thought?: string;
-  /** System messages only: "switch" | "error" | "delegation". */
+  /** System: "switch" | "error" | "delegation" | "resume" | "notification" | "routine". */
   kind?: string;
   /**
    * The user redirected the agent while this answer was being written. The
@@ -70,6 +76,8 @@ export interface SlotInfo {
 export interface PermissionRequest {
   request_id: string;
   summary: string;
+  /** Which agent, on which server, raised it. Empty when unattributable. */
+  origin?: string;
 }
 
 /**
@@ -140,17 +148,20 @@ function foldIntoStream(
 /**
  * End the turn: whatever is on screen is what was said.
  *
- * Only the last message can be open — a bubble stops being foldable the moment
- * anything is appended after it — so closing it is enough, and returning the
- * same array when there is nothing to close keeps a `prompt_done` for an idle
- * slot from re-rendering the transcript.
+ * Every open bubble is closed, not just the last one. A bubble stops being
+ * *foldable* the moment anything is appended after it, but it does not stop
+ * being open: an out-of-band note (a routine outcome pushed mid-answer) lands
+ * after a bubble the turn was still writing into, and that bubble is what
+ * `open` has to keep describing until the turn actually ends. Closing only the
+ * tail left it flagged open forever, and the next turn in the same slot lit it
+ * up as live again.
+ *
+ * Returning the same array when there is nothing to close keeps a
+ * `prompt_done` for an idle slot from re-rendering the transcript.
  */
 function closeStream(msgs: ChatMessage[]): ChatMessage[] {
-  const last = msgs.length - 1;
-  if (last < 0 || !msgs[last].open) return msgs;
-  const out = [...msgs];
-  out[last] = { ...out[last], open: false };
-  return out;
+  if (!msgs.some((m) => m.open)) return msgs;
+  return msgs.map((m) => (m.open ? { ...m, open: false } : m));
 }
 
 /** Stop every tool call that is still spinning. A prompt that ended, ended. */
@@ -219,8 +230,19 @@ function turnsToMessages(turns: ConversationTurn[]): ChatMessage[] {
  */
 const FLUSH_INTERVAL_MS = 50;
 
+/**
+ * The bell's cache key (FEAT-048).
+ *
+ * Lives here because this is where the live `notification` event is written
+ * into it; `NotificationBell` reads the same key, so a pushed notice and a
+ * fetched one are one list. Not server-scoped: notifications belong to the
+ * user, not to whichever trading server is selected.
+ */
+export const NOTIFICATIONS_KEY = ["notifications"] as const;
+
 export function useChatSocket() {
   const { token, user } = useAuth();
+  const queryClient = useQueryClient();
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   // Whether this hook still wants a socket. `close()` is asynchronous, so the
@@ -248,6 +270,12 @@ export function useChatSocket() {
   // The dashboard prewarms the most recent conversation once per mount, never
   // per reconnect: the 3s retry loop would otherwise spawn on every failure.
   const prewarmed = useRef(false);
+  // Prewarming is the chat workspace's privilege, not a side effect of holding
+  // the socket open. `prewarmDeferred` is the one prewarm an empty roster asked
+  // for while nobody was allowed to grant it, kept so opening the workspace
+  // later is still warm.
+  const prewarmAllowed = useRef(false);
+  const prewarmDeferred = useRef(false);
 
   const [isConnected, setIsConnected] = useState(false);
   const [slots, setSlots] = useState<ChatSlot[]>([]);
@@ -573,7 +601,11 @@ export function useChatSocket() {
           info: {
             slot_id: conversationId,
             conversation_id: conversationId,
-            agent_key: meta?.agent_key || "",
+            // The record's key is a log of what answered last, so for a bound
+            // conversation it is not what is about to: the server resolves the
+            // Agent's *current* model. `""` lets the picker fall back to that
+            // rather than flashing a model the resume will not use.
+            agent_key: meta?.agent_slug ? "" : meta?.agent_key || "",
             server_name: meta?.server_name,
             agent_slug: meta?.agent_slug,
             label: meta?.label,
@@ -598,9 +630,19 @@ export function useChatSocket() {
    * is no user-agnostic warm process to hand out. Prewarming on *selection* —
    * and this, the implicit selection of "the chat you were last in" — is the
    * same latency win without idle processes burning the session budget.
+   *
+   * Which is exactly why it is gated. The shell holds the socket open on every
+   * route so push frames arrive wherever the user is standing, and on most of
+   * those routes the roster comes back empty — prewarming there would spawn a
+   * subprocess for someone who only opened /portfolio. The empty roster is
+   * remembered instead, and `enablePrewarm` redeems it.
    */
   const prewarmLatest = useCallback(() => {
     if (prewarmed.current) return;
+    if (!prewarmAllowed.current) {
+      prewarmDeferred.current = true;
+      return;
+    }
     prewarmed.current = true;
     api
       .listConversations(1)
@@ -619,6 +661,22 @@ export function useChatSocket() {
         // No history, or the API is down. Either way the panel still works.
       });
   }, [resumeConversation]);
+
+  /**
+   * Say that this surface is a chat.
+   *
+   * Only the workspace calls it. Everywhere else the connection exists to
+   * receive push frames — a finished delegation, a routine's notice — and a
+   * user who never asked for an agent should not be given one. Calling it also
+   * redeems the prewarm an empty roster deferred, so arriving at the workspace
+   * after the shell already connected is as warm as opening it cold.
+   */
+  const enablePrewarm = useCallback(() => {
+    prewarmAllowed.current = true;
+    if (!prewarmDeferred.current) return;
+    prewarmDeferred.current = false;
+    prewarmLatest();
+  }, [prewarmLatest]);
 
   const handleEvent = useCallback(
     (data: Record<string, unknown>) => {
@@ -823,6 +881,7 @@ export function useChatSocket() {
             [askingSlot]: {
               request_id: data.request_id as string,
               summary: data.summary as string,
+              origin: (data.origin as string) || "",
             },
           }));
           break;
@@ -858,6 +917,38 @@ export function useChatSocket() {
           // dashboard ate my message" and "it is next in line".
           if (!slotId) break;
           setQueuedSlots((prev) => (prev[slotId] ? prev : { ...prev, [slotId]: true }));
+          break;
+        }
+
+        case "system_note": {
+          // Something finished in the background and wrote a note into the
+          // transcript — a routine's outcome, most often. The note is already
+          // recorded server-side; this only puts it on screen without a reload.
+          // Appended after the buffered text so it cannot cut an answer in half.
+          if (!slotId) break;
+          flushChunks(slotId);
+          const noteText = (data.text as string) || "";
+          const noteKind = (data.kind as string) || undefined;
+          if (!noteText) break;
+          setSlots((prev) =>
+            prev.map((s) =>
+              s.info.slot_id === slotId
+                ? {
+                    ...s,
+                    messages: [
+                      ...s.messages,
+                      {
+                        id: nextMsgId(),
+                        role: "system" as const,
+                        text: noteText,
+                        kind: noteKind,
+                        toolCalls: [],
+                      },
+                    ],
+                  }
+                : s,
+            ),
+          );
           break;
         }
 
@@ -917,6 +1008,37 @@ export function useChatSocket() {
           break;
         }
 
+        case "notification": {
+          // A background task finished (FEAT-048). Addressed to the *user*, not
+          // to a conversation, so it carries no slot and goes nowhere near the
+          // transcript — it lands in the bell's react-query cache, which is the
+          // same place `GET /notifications` fills on mount. Writing into the
+          // cache rather than into local state is what lets the bell be a leaf
+          // component with no wiring back up to here.
+          const incoming: AppNotification = {
+            id: (data.id as string) || "",
+            user_id: 0,
+            ts: (data.ts as number) || Date.now() / 1000,
+            kind: (data.kind as string) || "system",
+            text: (data.text as string) || "",
+            title: (data.title as string) || null,
+            link: (data.link as string) || null,
+            read: false,
+          };
+          if (!incoming.id) break;
+          queryClient.setQueryData<NotificationsResponse>(
+            NOTIFICATIONS_KEY,
+            (prev) => {
+              // A reconnect can replay one we already hold; keyed by id so it
+              // is never listed twice.
+              const rest = (prev?.items ?? []).filter((n) => n.id !== incoming.id);
+              const items = [incoming, ...rest].slice(0, 50);
+              return { items, unread: items.filter((n) => !n.read).length };
+            },
+          );
+          break;
+        }
+
         case "heartbeat":
           break;
       }
@@ -927,6 +1049,7 @@ export function useChatSocket() {
       flushChunks,
       hydrateSlot,
       prewarmLatest,
+      queryClient,
       send,
       stopStreaming,
     ],
@@ -1230,6 +1353,7 @@ export function useChatSocket() {
     permissionRequest,
     permissionRequests,
     connect,
+    enablePrewarm,
     disconnect,
     sendMessage,
     startSession,

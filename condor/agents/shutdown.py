@@ -20,7 +20,10 @@ import asyncio
 import logging
 from typing import Any
 
-from .strategy import Strategy, _parse_frontmatter
+from condor.frontmatter import parse_frontmatter
+from condor.runtime.timeouts import resolve_tick_timeout
+
+from .strategy import Strategy
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +94,7 @@ def load_shutdown_policy(strategy: Strategy) -> tuple[ShutdownPolicy, str]:
         if not path.exists():
             continue
         try:
-            meta, body = _parse_frontmatter(path.read_text())
+            meta, body = parse_frontmatter(path.read_text())
             return ShutdownPolicy.from_dict(meta), body.strip()
         except Exception:
             log.exception("Failed to parse shutdown.md at %s", path)
@@ -203,7 +206,7 @@ async def _deterministic_baseline(
     Each stop is isolated so one failure never aborts the rest. Returns
     ``(stopped_count, failures)``.
     """
-    from condor.fetchers.executors import stop_executor
+    from condor.fetchers.executors import describe_executor_error, stop_executor
 
     running = await _get_running_executors(engine, client)
     stopped = 0
@@ -214,14 +217,15 @@ async def _deterministic_baseline(
             continue
         keep = _keep_position(ex, policy)
         try:
-            result = await stop_executor(client, ex_id, keep_position=keep)
-        except Exception as e:  # stop_executor already guards, but be defensive
-            failures.append(f"stop {ex_id}: {e}")
+            await stop_executor(client, ex_id, keep_position=keep)
+        except Exception as e:
+            # A raise is the only failure signal: these failures are read back
+            # by the operator and by the LLM cleanup pass, so keep the raw
+            # exception (which embeds the backend URL) out of them.
+            _, message = describe_executor_error(e)
+            failures.append(f"stop {ex_id}: {message}")
             continue
-        if isinstance(result, dict) and result.get("status") == "error":
-            failures.append(f"stop {ex_id}: {result.get('message')}")
-        else:
-            stopped += 1
+        stopped += 1
     return stopped, failures
 
 
@@ -297,10 +301,11 @@ async def _run_llm_cleanup(
 ) -> None:
     """Best-effort LLM nuance pass on top of the guaranteed deterministic floor.
 
-    Bounded by a hard 300s timeout (the same ceiling the tick ACP session runs
-    under) and fully fail-open: the safety-critical winddown already happened, so
-    any hang or error here is logged and swallowed — it can never strand a position
-    the way an LLM-only shutdown could.
+    Bounded by the same budget the tick agent session runs under (the shared
+    timeout policy, overridable per run with ``tick_timeout_sec``) and fully
+    fail-open: the safety-critical winddown already happened, so any hang or
+    error here is logged and swallowed — it can never strand a position the way
+    an LLM-only shutdown could.
     """
     agent = getattr(engine, "agent", None)
     if not body or agent is None:
@@ -311,7 +316,10 @@ async def _run_llm_cleanup(
         running = await _get_running_executors(engine, client)
         positions = await _fetch_positions(client, engine.agent_id)
         context = _build_llm_context(policy, running, positions, failures)
-        async with asyncio.timeout(300):
+        cleanup_timeout = resolve_tick_timeout(
+            strategy=engine.config.get("tick_timeout_sec")
+        )
+        async with asyncio.timeout(cleanup_timeout):
             await _run_agent_to_completion(
                 slug=agent.slug,
                 user_id=engine.user_id,
@@ -409,15 +417,26 @@ async def run_shutdown(engine: Any, reason: str) -> None:
         log.error(msg)
         await engine._notify(msg)
         if engine.journal:
+            # Same "assert only what is known" rule as the alert above: a bare
+            # "no API client" journals the failure but throws away the only
+            # evidence of WHY, and this is the entry an operator reads with
+            # positions possibly still open. Record the cause when one was
+            # captured, and say plainly that it was not when it wasn't.
             detail = (
                 f"no API client: {why}"
                 if why
                 else "no API client (cause not recorded)"
             )
-            engine.journal.append_action(
-                engine.journal.tick_count + 1, "shutdown_failed", detail
-            )
-            engine.journal.record_tick("shutdown failed (no client): " + reason)
+            # Both journal.md updates of this failed winddown go into one batch,
+            # so the file is rewritten once instead of twice (PERF-136 idiom,
+            # PERF-173). The batch flushes in a finally, so a raise inside it
+            # still journals what it had recorded — which matters most on this
+            # branch, where the winddown never got a client.
+            with engine.journal.batch():
+                engine.journal.append_action(
+                    engine.journal.tick_count + 1, "shutdown_failed", detail
+                )
+                engine.journal.record_tick("shutdown failed (no client): " + reason)
         return
 
     stopped, failures = await _deterministic_baseline(engine, client, policy)
@@ -446,9 +465,12 @@ async def run_shutdown(engine: Any, reason: str) -> None:
 
     if engine.journal:
         verified = "flat" if not stranded else f"{len(stranded)} stranded"
-        engine.journal.append_action(
-            engine.journal.tick_count + 1,
-            "shutdown_done",
-            f"stopped={stopped}, failures={len(failures)}, verify={verified}",
-        )
-        engine.journal.record_tick("shutdown: " + reason)
+        # Both journal.md updates of this winddown go into one batch, so the file
+        # is rewritten once instead of twice (PERF-136 idiom, PERF-173).
+        with engine.journal.batch():
+            engine.journal.append_action(
+                engine.journal.tick_count + 1,
+                "shutdown_done",
+                f"stopped={stopped}, failures={len(failures)}, verify={verified}",
+            )
+            engine.journal.record_tick("shutdown: " + reason)

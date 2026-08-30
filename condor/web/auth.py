@@ -1,26 +1,22 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
 import os
 import secrets
 import time
 from typing import Optional
 
-from fastapi import Depends, HTTPException, WebSocket, status
+from fastapi import Depends, HTTPException, Query, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
 from condor.web.models import WebUser
-from config_manager import UserRole, get_config_manager
-from utils.config import TELEGRAM_TOKEN
+from config_manager import ServerPermission, UserRole, get_config_manager
 
 logger = logging.getLogger(__name__)
 
 _ALGORITHM = "HS256"
 _TOKEN_EXPIRE_SECONDS = 86400  # 24 hours
-_AUTH_WINDOW_SECONDS = 86400  # accept auth_date within 24 hours
 _LOGIN_TOKEN_TTL = 300  # one-time login tokens valid for 5 minutes
 
 _bearer_scheme = HTTPBearer()
@@ -44,28 +40,6 @@ def _jwt_secret() -> str:
     if web_secret:
         return web_secret
     return get_config_manager().get_or_create_web_jwt_secret()
-
-
-# ── Telegram Login Widget verification ──
-
-
-def verify_telegram_login(data: dict) -> bool:
-    """Verify data from the Telegram Login Widget using HMAC-SHA256."""
-    check_hash = data.get("hash", "")
-    auth_date = data.get("auth_date", 0)
-
-    # Check auth_date freshness
-    if abs(time.time() - int(auth_date)) > _AUTH_WINDOW_SECONDS:
-        return False
-
-    # Build check string (alphabetically sorted key=value, excluding hash)
-    filtered = {k: v for k, v in data.items() if k != "hash"}
-    check_string = "\n".join(f"{k}={v}" for k, v in sorted(filtered.items()))
-
-    secret_key = hashlib.sha256(TELEGRAM_TOKEN.encode()).digest()
-    computed = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
-
-    return hmac.compare_digest(computed, check_hash)
 
 
 # ── JWT helpers ──
@@ -152,6 +126,86 @@ async def get_current_user(
         first_name=payload.get("first_name", ""),
         role=role.value,
     )
+
+
+# ── Server-scoped access (SEC-147) ──
+
+
+def check_server_access(user_id: int, server_name: str) -> None:
+    """Raise ``403 No access`` unless ``user_id`` may use ``server_name``.
+
+    Single implementation of the guard that used to be hand-copied into every
+    server-scoped web endpoint. ``has_server_access`` defaults to
+    :attr:`ServerPermission.TRADER`, which is the level every web call already
+    required. Endpoints that need a *stronger* level (owner-only credential and
+    server mutations in ``routes/settings.py``) still layer their own check on
+    top of this one — this is the floor, never the ceiling.
+
+    Endpoints whose server name arrives in the request **body** call this
+    directly (a path/query dependency cannot see the body); endpoints that take
+    it as a path or query parameter use the ``require_server_access*``
+    dependencies below, which are thin wrappers over this function.
+    """
+    if not get_config_manager().has_server_access(user_id, server_name):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access")
+
+
+def require_owner(cm, user_id: int, server_name: str) -> None:
+    """Enforce the OWNER line on top of the TRADER floor every route already has.
+
+    The rule (SEC-153, extended to the gateway by SEC-166, and to the gateway
+    token list by SEC-207):
+
+    * **Reading** a server's state — status, logs, wallet and network listings,
+      configured connectors — needs TRADER. A shared trader has to be able to
+      see what they are trading against, and to tell the owner when it is down.
+    * **Trading** on a server needs TRADER. That is what the share is for.
+    * **Mutating a server's configuration or its infrastructure** needs OWNER.
+      Exchange credentials, the gateway container lifecycle, the private keys
+      in its keystore, the RPC endpoints it dials and the entries on its token
+      list are all the owner's machine, not a trading action — and each of them
+      can break the owner's running bots for everyone else on the server.
+
+    Admins keep the bypass they hold everywhere else in the web layer.
+
+    Lives here rather than in ``routes/settings.py`` (its first home) because
+    it is the ceiling to this module's floor, and a second hand-copied
+    implementation in the next router that needs it is how the line drifts.
+    """
+    perm = cm.get_server_permission(user_id, server_name)
+    if perm != ServerPermission.OWNER and not cm.is_admin(user_id):
+        raise HTTPException(status_code=403, detail="Owner access required")
+
+
+async def require_server_access(
+    name: str, user: WebUser = Depends(get_current_user)
+) -> WebUser:
+    """Auth dependency for endpoints routed under ``/servers/{name}/...``.
+
+    Drop-in replacement for ``Depends(get_current_user)``: it returns the same
+    :class:`WebUser`, having first enforced access to the ``{name}`` path
+    parameter. If the route has no ``{name}`` path parameter FastAPI treats it
+    as a required *query* parameter and the request fails with 422 — the guard
+    fails closed, never open.
+    """
+    check_server_access(user.id, name)
+    return user
+
+
+async def require_server_access_by_server_name(
+    server_name: str, user: WebUser = Depends(get_current_user)
+) -> WebUser:
+    """Same as :func:`require_server_access` for a ``{server_name}`` path param."""
+    check_server_access(user.id, server_name)
+    return user
+
+
+async def require_server_access_query(
+    server: str = Query(...), user: WebUser = Depends(get_current_user)
+) -> WebUser:
+    """Same as :func:`require_server_access` for a ``?server=`` query param."""
+    check_server_access(user.id, server)
+    return user
 
 
 # ── One-time login tokens (generated from Telegram /web command) ──

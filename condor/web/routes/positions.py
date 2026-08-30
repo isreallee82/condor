@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
-from config_manager import get_config_manager
-from condor.web.auth import get_current_user
+from condor.web.auth import require_server_access
 from condor.web.models import WebUser
+from config_manager import get_config_manager
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,14 @@ def _normalize_position(pos: dict, source: str, source_name: str) -> dict:
         notional_value = abs(float(amount)) * float(entry_price)
     except (ValueError, TypeError):
         notional_value = 0
+    # Which executors this row aggregates. The only attribution the API gives a
+    # held position: a position has no pool of its own, but an LP executor
+    # records the pool it opened in, so the pool workspace can tell a hold that
+    # belongs to the pool on screen from one held in another pool of the same
+    # pair on the same chain.
+    executor_ids = pos.get("executor_ids") or []
+    if not isinstance(executor_ids, list):
+        executor_ids = []
     return {
         "connector_name": pos.get("connector_name") or pos.get("connector") or "",
         "trading_pair": pos.get("trading_pair") or "",
@@ -30,12 +38,15 @@ def _normalize_position(pos: dict, source: str, source_name: str) -> dict:
         "entry_price": entry_price,
         "notional_value": notional_value,
         "current_price": pos.get("current_price") or 0,
-        "unrealized_pnl": pos.get("unrealized_pnl_quote") or pos.get("unrealized_pnl") or 0,
+        "unrealized_pnl": pos.get("unrealized_pnl_quote")
+        or pos.get("unrealized_pnl")
+        or 0,
         "leverage": pos.get("leverage") or 1,
         "controller_id": pos.get("controller_id") or "",
         "realized_pnl": pos.get("realized_pnl_quote") or 0,
         "cum_fees": pos.get("cum_fees_quote") or 0,
         "executor_count": pos.get("executor_count") or 0,
+        "executor_ids": [str(i) for i in executor_ids],
         "source": source,
         "source_name": source_name,
     }
@@ -44,11 +55,9 @@ def _normalize_position(pos: dict, source: str, source_name: str) -> dict:
 @router.get("/servers/{name}/positions")
 async def get_consolidated_positions(
     name: str,
-    user: WebUser = Depends(get_current_user),
+    user: WebUser = Depends(require_server_access),
 ):
     cm = get_config_manager()
-    if not cm.has_server_access(user.id, name):
-        raise HTTPException(status_code=403, detail="No access")
 
     from condor.server_data_service import ServerDataType, get_server_data_service
 
@@ -72,7 +81,9 @@ async def get_consolidated_positions(
 
     async def fetch_bot_positions():
         try:
-            result = await get_server_data_service().get_or_fetch(name, ServerDataType.BOTS_STATUS)
+            result = await get_server_data_service().get_or_fetch(
+                name, ServerDataType.BOTS_STATUS
+            )
             if result is None:
                 return []
 
@@ -81,7 +92,11 @@ async def get_consolidated_positions(
             if isinstance(result, dict):
                 data = result.get("data", {})
                 if isinstance(data, dict):
-                    bots_list = [{"bot_name": k, **v} for k, v in data.items() if isinstance(v, dict)]
+                    bots_list = [
+                        {"bot_name": k, **v}
+                        for k, v in data.items()
+                        if isinstance(v, dict)
+                    ]
                 elif isinstance(data, list):
                     bots_list = [b for b in data if isinstance(b, dict)]
             elif isinstance(result, list):
@@ -121,8 +136,7 @@ async def get_consolidated_positions(
     ]
 
     bot_positions = [
-        _normalize_position(pos, "bot", source_name)
-        for pos, source_name in bot_raw
+        _normalize_position(pos, "bot", source_name) for pos, source_name in bot_raw
     ]
 
     # Enrich positions missing current_price (the positions_summary endpoint doesn't provide it)

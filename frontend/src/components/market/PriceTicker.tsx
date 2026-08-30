@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
-import { candleStore } from "@/lib/candle-store";
+import { candleChannelKey, candleStore } from "@/lib/candle-store";
 
 interface PriceTickerProps {
   server: string;
@@ -10,9 +10,15 @@ interface PriceTickerProps {
   pair: string;
   /** Candle interval to track — defaults to "1m" for most responsive updates */
   interval?: string;
+  /**
+   * Whether `/market/prices` answers for this connector. False for gateway DEX
+   * networks, where the candle close is the only price and the REST call would
+   * only 502; bid/ask/spread are then simply absent.
+   */
+  hasRestPrice?: boolean;
 }
 
-export function PriceTicker({ server, connector, pair, interval = "1m" }: PriceTickerProps) {
+export function PriceTicker({ server, connector, pair, interval = "1m", hasRestPrice = true }: PriceTickerProps) {
   const prevPriceRef = useRef<number>(0);
   const [candlePrice, setCandlePrice] = useState<number>(0);
 
@@ -20,16 +26,18 @@ export function PriceTicker({ server, connector, pair, interval = "1m" }: PriceT
   useEffect(() => {
     if (!server || !connector || !pair) {
       setCandlePrice(0);
+      prevPriceRef.current = 0;
       return;
     }
 
-    const key = `candles:${server}:${connector}:${pair}:${interval}`;
+    const key = candleChannelKey(server, connector, pair, interval);
 
-    // Check existing cached candles
+    // Seed from cache unconditionally: an empty cache for the newly subscribed
+    // channel must clear the previous market's close, or `displayPrice` below
+    // keeps preferring it over the REST mid_price this pair already resolved.
     const cached = candleStore.subscribe(key);
-    if (cached.length > 0) {
-      setCandlePrice(cached[cached.length - 1].close);
-    }
+    setCandlePrice(cached[cached.length - 1]?.close ?? 0);
+    prevPriceRef.current = 0; // never colour a new pair against the old one's price
 
     const removeListener = candleStore.onUpdate(key, (candles) => {
       if (candles.length > 0) {
@@ -47,7 +55,7 @@ export function PriceTicker({ server, connector, pair, interval = "1m" }: PriceT
   const { data: price } = useQuery({
     queryKey: ["price", server, connector, pair],
     queryFn: () => api.getPrice(server, connector, pair),
-    enabled: !!server && !!connector && !!pair,
+    enabled: !!server && !!connector && !!pair && hasRestPrice,
     refetchInterval: 15_000,
   });
 

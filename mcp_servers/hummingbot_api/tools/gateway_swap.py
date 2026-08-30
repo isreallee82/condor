@@ -5,6 +5,7 @@ Handles DEX trading operations via Hummingbot Gateway:
 - Swap quote/execute (Router: Jupiter, 0x)
 - Swap search and status tracking
 """
+
 import logging
 from decimal import Decimal
 from typing import Any
@@ -15,19 +16,29 @@ from mcp_servers.hummingbot_api.schemas import GatewaySwapRequest
 logger = logging.getLogger("hummingbot-mcp")
 
 
-async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict[str, Any]:
+async def manage_gateway_swaps(
+    client: Any, request: GatewaySwapRequest
+) -> dict[str, Any]:
     """
     Manage Gateway swap operations: quote, execute, search, and status tracking.
 
     Actions:
     - quote: Get price quote for a swap before executing
-    - execute: Execute a swap transaction on DEX
+    - execute: Execute a swap transaction on DEX, priced at execution
+    - execute_quote: Execute a quote already taken, by its quote_id (routers only)
     - search: Search swap history with various filters
     - get_status: Get status of a specific swap by transaction hash
 
     Supported DEX Connectors:
     - jupiter (Solana): Router for Solana swaps
     - 0x (Ethereum): Aggregator for EVM chains
+
+    A quote carrying `approximation: true` reports an ESTIMATED amount_out rather than
+    the exact-out amount asked for. A BUY is an ExactOut order, and a thin token with no
+    ExactOut route is quoted by pricing the sell leg and quoting that input forward,
+    which costs roughly 2.5%. Nobody is overcharged — the order is silently resized — so
+    say so whenever the quantity is what the user cares about, and pass
+    extra_params={'approximateIfNoExactOut': False} to require an exact route instead.
     """
     # ============================================
     # QUOTE - Get swap price quote
@@ -47,7 +58,9 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
 
         # Parse trading pair
         if "-" not in request.trading_pair:
-            raise ToolError(f"Invalid trading_pair format. Expected 'BASE-QUOTE', got '{request.trading_pair}'")
+            raise ToolError(
+                f"Invalid trading_pair format. Expected 'BASE-QUOTE', got '{request.trading_pair}'"
+            )
 
         result = await client.gateway_swap.get_swap_quote(
             connector=request.connector,
@@ -55,7 +68,13 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
             trading_pair=request.trading_pair,
             side=request.side,
             amount=Decimal(request.amount),
-            slippage_pct=Decimal(request.slippage_pct or "1.0")
+            # None -> SDK omits it and the connector's configured slippage applies
+            slippage_pct=(
+                Decimal(request.slippage_pct)
+                if request.slippage_pct is not None
+                else None
+            ),
+            extra_params=request.extra_params,
         )
 
         return {
@@ -63,7 +82,7 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
             "trading_pair": request.trading_pair,
             "side": request.side,
             "amount": request.amount,
-            "result": result
+            "result": result,
         }
 
     # ============================================
@@ -84,7 +103,9 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
 
         # Parse trading pair
         if "-" not in request.trading_pair:
-            raise ToolError(f"Invalid trading_pair format. Expected 'BASE-QUOTE', got '{request.trading_pair}'")
+            raise ToolError(
+                f"Invalid trading_pair format. Expected 'BASE-QUOTE', got '{request.trading_pair}'"
+            )
 
         result = await client.gateway_swap.execute_swap(
             connector=request.connector,
@@ -92,8 +113,14 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
             trading_pair=request.trading_pair,
             side=request.side,
             amount=Decimal(request.amount),
-            slippage_pct=Decimal(request.slippage_pct or "1.0"),
-            wallet_address=request.wallet_address
+            # None -> SDK omits it and the connector's configured slippage applies
+            slippage_pct=(
+                Decimal(request.slippage_pct)
+                if request.slippage_pct is not None
+                else None
+            ),
+            wallet_address=request.wallet_address,
+            extra_params=request.extra_params,
         )
 
         return {
@@ -102,7 +129,48 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
             "side": request.side,
             "amount": request.amount,
             "wallet_address": request.wallet_address or "(default)",
-            "result": result
+            "result": result,
+        }
+
+    # ============================================
+    # EXECUTE_QUOTE - Commit to a quote already taken
+    # ============================================
+    elif request.action == "execute_quote":
+        if not request.connector:
+            raise ToolError("connector is required for execute_quote action")
+        if not request.network:
+            raise ToolError("network is required for execute_quote action")
+        if not request.quote_id:
+            raise ToolError(
+                "quote_id is required for execute_quote action: take a quote first "
+                "(action='quote') and pass the quote_id it returns. Only router connectors "
+                "return one."
+            )
+        if not request.trading_pair or not request.side or not request.amount:
+            raise ToolError(
+                "trading_pair, side and amount are required for execute_quote: Gateway "
+                "identifies the swap by quote_id alone, but the recorded trade has to be "
+                "filed under the pair and size it was for."
+            )
+
+        result = await client.gateway_swap.execute_quote(
+            connector=request.connector,
+            network=request.network,
+            quote_id=request.quote_id,
+            trading_pair=request.trading_pair,
+            side=request.side,
+            amount=Decimal(request.amount),
+            wallet_address=request.wallet_address,
+        )
+
+        return {
+            "action": "execute_quote",
+            "trading_pair": request.trading_pair,
+            "side": request.side,
+            "amount": request.amount,
+            "quote_id": request.quote_id,
+            "wallet_address": request.wallet_address or "(default)",
+            "result": result,
         }
 
     # ============================================
@@ -117,7 +185,7 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
         return {
             "action": "get_status",
             "transaction_hash": request.transaction_hash,
-            "result": result
+            "result": result,
         }
 
     # ============================================
@@ -125,10 +193,7 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
     # ============================================
     elif request.action == "search":
         # Build search filters
-        search_params = {
-            "limit": request.limit or 50,
-            "offset": request.offset or 0
-        }
+        search_params = {"limit": request.limit or 50, "offset": request.offset or 0}
 
         # Add optional filters
         if request.search_network:
@@ -150,12 +215,14 @@ async def manage_gateway_swaps(client: Any, request: GatewaySwapRequest) -> dict
 
         return {
             "action": "search",
-            "filters": {k: v for k, v in search_params.items() if k not in ["limit", "offset"]},
+            "filters": {
+                k: v for k, v in search_params.items() if k not in ["limit", "offset"]
+            },
             "pagination": {
                 "limit": search_params["limit"],
-                "offset": search_params["offset"]
+                "offset": search_params["offset"],
             },
-            "result": result
+            "result": result,
         }
 
     else:

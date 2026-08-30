@@ -46,10 +46,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from condor.frontmatter import parse_frontmatter, render_frontmatter, slugify
+from condor.fsutil import atomic_write_text
 from condor.memory.paths import CHAT_SLUG
-from condor.memory.store import _parse_frontmatter
-
-from .strategy import _render_frontmatter, _slugify
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +123,14 @@ def identity_header(slug: str, name: str = "") -> str:
     Condor is an agent like any other now (FEAT-033), so it can reach here — and
     the specialist text would be self-contradictory for it ("You ARE Condor …
     You are NOT Condor"). It gets the coordinator's framing instead.
+
+    It rules out CONSULT on yourself and nothing more (FEAT-041). Delegating to
+    your own slug is legitimate — it starts a background session of you — and it
+    is only legitimate from the interactive seat, so the rule belongs with the
+    seat-aware routing text (``_agent_base`` / ``_chat_base`` / ``_worker_base``),
+    not in a line both seats read verbatim. Saying "never delegate to yourself"
+    here contradicted the chat's own routine-authoring rule and was why an agent
+    refused to spawn a copy of itself.
     """
     label = name or slug
     if slug == CHAT_SLUG:
@@ -131,14 +138,18 @@ def identity_header(slug: str, name: str = "") -> str:
             "You ARE Condor (slug: `condor`), the chat assistant the user talks "
             "to. You are the coordinator, not a specialist: domain work goes to "
             "the agents listed for you, and their answers come back through you. "
-            "Never consult or delegate to `condor`, because that is you."
+            "Never consult `condor`, because that is you (delegating to `condor` "
+            "is different — it starts a background session of you, and the "
+            "routing rules below say when that is right)."
         )
     return (
         f'You ARE the "{label}" agent (slug: `{slug}`) running inside Condor. '
         "You are NOT Condor, the chat assistant — Condor is a different "
         f"assistant that can consult you. Answer in the first person as {label}: "
-        f"never describe {label} in the third person, and never consult or "
-        f"delegate to `{slug}`, because that is you."
+        f"never describe {label} in the third person, and never consult "
+        f"`{slug}`, because that is you (delegating to `{slug}` is different — it "
+        "starts a background session of you, and the routing rules below say "
+        "when that is right)."
     )
 
 
@@ -148,7 +159,7 @@ def _load_agent_from_dir(agent_dir: Path) -> Agent | None:
     if not path.exists():
         return None
     try:
-        meta, body = _parse_frontmatter(path.read_text())
+        meta, body = parse_frontmatter(path.read_text())
         return Agent(
             slug=agent_dir.name,
             name=meta.get("name", agent_dir.name),
@@ -242,7 +253,7 @@ class AgentStore:
         server_name: str = "",
         created_by: int = 0,
     ) -> Agent:
-        slug = _slugify(name)
+        slug = slugify(name)
         if slug == CHAT_SLUG:
             # Reserved: `condor` names the default agent. The separate trees used
             # to make the collision impossible by construction (FEAT-003); with
@@ -304,8 +315,9 @@ class AgentStore:
             "created_at": agent.created_at,
         }
         agent.agent_dir.mkdir(parents=True, exist_ok=True)
-        (agent.agent_dir / "AGENT.md").write_text(
-            _render_frontmatter(meta, agent.instructions)
+        atomic_write_text(
+            agent.agent_dir / "AGENT.md",
+            render_frontmatter(meta, agent.instructions),
         )
 
     def _iter_agent_dirs(self):

@@ -9,18 +9,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from condor.telemetry.taps import web_tap
 from condor.web.routes import (
+    admin,
     agents,
     archived,
     auth,
     backtesting,
     bots,
     chat_ws,
+    code,
     confirmations,
     controller_performance,
     conversations,
+    dex,
     executors,
     market,
+    meta,
+    notifications,
     portfolio,
     positions,
     reports,
@@ -28,6 +34,7 @@ from condor.web.routes import (
     servers,
     sessions,
     settings,
+    sharing,
     transcribe,
     ws,
 )
@@ -62,8 +69,15 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Usage telemetry (FEAT-023). Reports the matched route *template*
+    # (`/api/v1/bots/{name}`), never the URL, so cardinality is bounded by our
+    # own router and no path parameter — a bot name, a server name, a report id
+    # — is ever read. No-op unless the admin opted in.
+    app.middleware("http")(web_tap)
+
     # ── API routes ──
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(admin.router, prefix="/api/v1")
     app.include_router(servers.router, prefix="/api/v1")
     app.include_router(portfolio.router, prefix="/api/v1")
     app.include_router(bots.router, prefix="/api/v1")
@@ -73,15 +87,20 @@ def create_app() -> FastAPI:
     app.include_router(positions.router, prefix="/api/v1")
     app.include_router(backtesting.router, prefix="/api/v1")
     app.include_router(market.router, prefix="/api/v1")
+    app.include_router(dex.router, prefix="/api/v1")
+    app.include_router(meta.router, prefix="/api/v1")
+    app.include_router(notifications.router, prefix="/api/v1")
     app.include_router(ws.router, prefix="/api/v1")
     app.include_router(agents.router, prefix="/api/v1")
     app.include_router(routines.router, prefix="/api/v1")
+    app.include_router(code.router, prefix="/api/v1")
     app.include_router(reports.router, prefix="/api/v1")
     app.include_router(settings.router, prefix="/api/v1")
     app.include_router(sessions.router, prefix="/api/v1")
     app.include_router(chat_ws.router, prefix="/api/v1")
     app.include_router(confirmations.router, prefix="/api/v1")
     app.include_router(conversations.router, prefix="/api/v1")
+    app.include_router(sharing.router, prefix="/api/v1")
     app.include_router(transcribe.router, prefix="/api/v1")
 
     # Report bodies are NOT mounted here. They used to be served by an

@@ -21,6 +21,7 @@ from typing import Any
 
 from condor.runtime.registry_file import (
     BOOT_ID,
+    STATUS_FILENAME,
     LoopState,
     is_stale,
     read_status,
@@ -136,7 +137,15 @@ class LoopSupervisor:
         )
 
     def record_tick(self, engine) -> None:
-        """Cheap per-tick counter update; keeps the last tick honest on a crash."""
+        """Cheap per-tick counter update; keeps the last tick honest on a crash.
+
+        Never for an engine that already left the registry: stop/shutdown wrote
+        its final state on the way out, and rewriting RUNNING over it would make
+        the next boot read a finished run as interrupted — and restart it when
+        the session opted into ``restart_on_boot``.
+        """
+        if self._engines.get(engine.agent_id) is not engine:
+            return
         self.record(engine, LoopState.RUNNING)
 
     # ── Lifecycle ──
@@ -217,7 +226,26 @@ class LoopSupervisor:
 
         Never restarted: a delegation is one-shot, and re-running it could
         duplicate whatever side effects it already had.
+
+        Walks the delegation store, which is keyed by user (FEAT-051), plus the
+        pre-FEAT-051 agent directories: an unowned legacy record has no user
+        directory to have been migrated into, and it can be stale too.
         """
+        from condor import paths
+
+        count = 0
+        for user_id in paths.iter_user_ids():
+            delegations = paths.delegations_dir(user_id)
+            if not delegations.is_dir():
+                continue
+            for record_dir in sorted(p for p in delegations.iterdir() if p.is_dir()):
+                count += self._interrupt_if_stale(record_dir, STATUS_FILENAME)
+
+        count += self._reconcile_legacy_delegations(agents_root)
+        return count
+
+    def _reconcile_legacy_delegations(self, agents_root: Path | None) -> int:
+        """The same sweep over ``agents/{slug}/delegations/{task}.status.json``."""
         from condor.agents.agent import _DATA_ROOT
 
         root = Path(agents_root) if agents_root is not None else _DATA_ROOT
@@ -230,17 +258,17 @@ class LoopSupervisor:
             if not delegations.is_dir():
                 continue
             for path in sorted(delegations.glob("*.status.json")):
-                status = read_status(delegations, path.name)
-                if not status or not is_stale(status):
-                    continue
-                write_status(
-                    delegations,
-                    path.name,
-                    state=LoopState.INTERRUPTED,
-                    boot_id=BOOT_ID,
-                )
-                count += 1
+                count += self._interrupt_if_stale(delegations, path.name)
         return count
+
+    @staticmethod
+    def _interrupt_if_stale(directory: Path, filename: str) -> int:
+        """1 when this status was left ``running`` by a process that is gone."""
+        status = read_status(directory, filename)
+        if not status or not is_stale(status):
+            return 0
+        write_status(directory, filename, state=LoopState.INTERRUPTED, boot_id=BOOT_ID)
+        return 1
 
     def _stale_sessions(self, agents_root: Path | None):
         """Yield (session_dir, status) for every run a dead process left live."""
@@ -290,7 +318,33 @@ class LoopSupervisor:
             # A missing/!writable journal must not stop us recording the state.
             log.warning("Could not annotate journal at %s", session_dir, exc_info=True)
 
+        # A crashed process never ran stop(), so the session's ownership window is
+        # still open and would keep accruing a surviving bot's PnL to a run that
+        # ended at boot. Close it here — the best instant we can honestly claim is
+        # the last one the dead process recorded (``updated_at``, bumped every
+        # tick), not now: everything between the crash and this reboot was traded
+        # by a bot nobody was operating, and must not land on this session.
+        self._release_ownership(session_dir, float(status.get("updated_at") or 0.0))
+
         write_status(session_dir, state=LoopState.INTERRUPTED, boot_id=BOOT_ID)
+
+    @staticmethod
+    def _release_ownership(session_dir: Path, at: float = 0.0) -> None:
+        """Close an interrupted session's bot-ownership window, if it kept one.
+
+        ``at`` is the instant to close it at; 0 (nothing recorded) falls back to
+        now, which is what a session with no status timestamp can honestly claim.
+        """
+        try:
+            from condor.agents.ownership import LEDGER_FILENAME, BotLedger
+
+            if not (session_dir / LEDGER_FILENAME).exists():
+                return  # executor-mode session — never owned a bot
+            BotLedger("", session_dir).release(at if at > 0 else None)
+        except Exception:
+            log.warning(
+                "Could not release bot ownership at %s", session_dir, exc_info=True
+            )
 
     @staticmethod
     def _owner_of(status: dict, agent, strategy) -> int:

@@ -11,23 +11,21 @@ through ``condor.runtime.client`` instead.
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from telegram import Bot
 
-from condor.acp import ACPClient, PermissionCallback, PromptDone, resolve_acp
-from condor.acp.pydantic_ai_client import (
-    PydanticAIClient,
-    is_pydantic_ai_model,
-    model_prefix,
-)
+from condor.acp import ACPClient, PermissionCallback, PromptDone
+from condor.acp.pydantic_ai_client import PydanticAIClient
 from condor.agents.agent import identity_header as agent_identity_header
 from condor.runtime import binding, conversations
+from condor.runtime.confirmations import get_registry as get_confirmation_registry
+from condor.runtime.context import build_initial_context, platform_formatting
 from condor.runtime.keys import SessionKey
 from condor.runtime.models import SessionInfo, SessionSpec
 from condor.runtime.timeouts import TIMEOUTS
-from handlers.agents._shared import build_initial_context, get_project_dir
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +43,44 @@ MAX_SESSIONS_PER_USER = 5
 # Module-level session storage keyed by str(SessionKey).
 # Not persisted -- subprocesses can't survive restarts.
 _sessions: dict[str, "AgentSession"] = {}
+
+# Creation serialization (CORR-187). get_or_create_session is a check-then-
+# create that spans many awaits (subprocess spawn, eager context prompt), so
+# without a lock two concurrent calls for the same key both spawn a full
+# client and the second registration overwrites the first, whose process tree
+# is never stopped -- teardown only walks the registry. Locks are per session
+# key (creations under different keys stay concurrent) and refcounted so the
+# dict does not grow with every key ever seen.
+_creation_locks: dict[str, asyncio.Lock] = {}
+_creation_lock_refs: dict[str, int] = {}
+
+# Session keys currently being created, per user. A creation in flight is not
+# in ``_sessions`` yet but will register one session, so the budget check has
+# to count it or N concurrent creates of distinct keys all pass the cap.
+_pending_creates: dict[int, set[str]] = {}
+
+
+@asynccontextmanager
+async def _creation_lock(name: str):
+    """Hold the named creation lock; drop it when the last holder leaves.
+
+    Refcounted rather than popped on release: popping while another task still
+    waits on the lock object would hand a *fresh* lock to the next caller and
+    reopen the race between the waiter and the newcomer.
+    """
+    lock = _creation_locks.setdefault(name, asyncio.Lock())
+    _creation_lock_refs[name] = _creation_lock_refs.get(name, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        remaining = _creation_lock_refs[name] - 1
+        if remaining:
+            _creation_lock_refs[name] = remaining
+        else:
+            del _creation_lock_refs[name]
+            _creation_locks.pop(name, None)
+
 
 # Health monitor state
 _health_task: asyncio.Task | None = None
@@ -154,6 +190,21 @@ class AgentSession:
                         PROMPT_OVERALL_TIMEOUT,
                         self.key,
                     )
+                    # Cancel at the agent before walking away, exactly as
+                    # abort() does. Breaking out only stops us *relaying*: the
+                    # turn would keep generating and keep running tools against
+                    # a permission callback nobody is watching, and the next
+                    # prompt would overlap it at the subprocess. Bounded by
+                    # TIMEOUTS.prompt_cancel with a local fallback, so this
+                    # cannot hang the caller.
+                    try:
+                        await self.client.abort_prompt()
+                    except Exception:  # noqa: BLE001 - never mask the timeout
+                        log.warning(
+                            "Could not cancel timed-out prompt for session %s",
+                            self.key,
+                            exc_info=True,
+                        )
                     yield PromptDone(stop_reason="timeout")
                     break
         finally:
@@ -184,7 +235,52 @@ class SessionLimitReached(RuntimeError):
     """Raised when a user already holds MAX_SESSIONS_PER_USER live sessions."""
 
 
-async def _enforce_session_budget(user_id: int) -> None:
+def _deny_pending_confirmations(raw_key: str) -> int:
+    """Deny whatever this session was still asking a human to approve.
+
+    A session that is going away cannot act on an approval, and the identity
+    that raised the request no longer exists — while the entry stays PENDING
+    its "Approve" button is still tappable, and after a respawn under the same
+    key it would authorize a live tool call for whoever is bound *now*. Denying
+    here, on the one funnel every teardown goes through (destroy, agent/server
+    switch, LRU detach, health-monitor reap, shutdown), is what keeps that from
+    depending on each caller remembering to.
+    """
+    try:
+        denied = get_confirmation_registry().deny_pending_for_session(raw_key)
+    except Exception:  # noqa: BLE001 - cleanup must never block a teardown
+        log.warning("Could not deny pending confirmations for %s", raw_key)
+        return 0
+    if denied:
+        log.info("Denied %d pending confirmation(s) tearing down %s", denied, raw_key)
+    return denied
+
+
+async def _notify_detached_by_budget(key: SessionKey) -> None:
+    """Tell a Telegram chat its session was detached to make room (CORR-227).
+
+    Only the health monitor used to speak into a chat it had torn down, and it
+    says "ended unexpectedly" because a dead subprocess is a fault. An LRU
+    detach is not a fault: the conversation is durable and the next message
+    reattaches it. Same delivery path, deliberately different words, so the
+    two are distinguishable from inside the chat.
+    """
+    chat_id = key.telegram_chat_id
+    if _health_bot is None or chat_id is None:
+        return
+    try:
+        await _health_bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Agent session detached to free a slot for another chat. "
+                "Send a message to pick up where you left off."
+            ),
+        )
+    except Exception:  # noqa: BLE001 - a notice must never break the budget
+        log.warning("Failed to notify chat %s about a detached session", chat_id)
+
+
+async def _enforce_session_budget(user_id: int, surface: str | None = None) -> None:
     """Reap dead sessions, detach the least recently used idle one, then refuse.
 
     Detaching used to be unthinkable — destroying a session destroyed the chat,
@@ -192,14 +288,29 @@ async def _enforce_session_budget(user_id: int) -> None:
     the conversation is durable (FEAT-015), the detached chat is fully
     recoverable and reattaching costs one lazy spawn, so the cap behaves as an
     LRU instead. Only when every session is *busy* is there nothing to give up.
+
+    The cap counts every surface (it bounds subprocesses, not tabs), but each
+    frontend only shows its own sessions — so a plain global LRU let a new web
+    tab silently detach a Telegram chat the user could not see (CORR-227).
+    ``surface`` is the incoming key's surface: the victim is chosen from that
+    surface first, and only when it has no idle session does eviction cross
+    over — audibly, for a Telegram victim.
     """
     for raw_key, session in list(_sessions.items()):
         if session.user_id == user_id and not session.client.alive:
+            # Dropped straight from the registry rather than through
+            # _destroy_session_internal (the subprocess is already gone), so
+            # the sweep it owns has to be repeated here.
+            _deny_pending_confirmations(raw_key)
             _sessions.pop(raw_key, None)
 
     while True:
         mine = [s for s in _sessions.values() if s.user_id == user_id]
-        if len(mine) < MAX_SESSIONS_PER_USER:
+        # Creations in flight for this user (reserved under the per-user
+        # creation lock, registered only later) hold budget too, or N
+        # concurrent creates of distinct keys would all pass the count.
+        in_flight = len(_pending_creates.get(user_id, set()) - set(_sessions))
+        if len(mine) + in_flight < MAX_SESSIONS_PER_USER:
             return
 
         idle = [s for s in mine if not s.is_busy]
@@ -209,15 +320,47 @@ async def _enforce_session_budget(user_id: int) -> None:
                 "Wait for one to finish, or cancel it."
             )
 
-        victim = min(idle, key=lambda s: s.last_prompt_at or s.created_at)
+        # Same surface first; the full list is the fallback that keeps the cap
+        # a cap even when this surface has nothing idle to give up.
+        same_surface = [s for s in idle if s.key.surface == surface]
+        crossed = not same_surface
+        victim = min(
+            same_surface or idle, key=lambda s: s.last_prompt_at or s.created_at
+        )
         log.info(
             "Session budget reached for user %s: detaching idle session %s "
-            "(conversation %s is kept)",
+            "(conversation %s is kept%s)",
             user_id,
             victim.key,
             victim.conversation_id or "none",
+            ", crossing surfaces" if crossed else "",
         )
         await _destroy_session_internal(victim.key)
+        if crossed:
+            await _notify_detached_by_budget(victim.key)
+
+
+def bound_agent_context(
+    bound: binding.SessionBinding, user_id: int, platform: str
+) -> str:
+    """The opening context of a chat bound to a specialist Agent.
+
+    A specialist opens with its own identity and domain memory rather than the
+    chat's context, which is what makes it a different brain instead of a skin
+    — but it meant it was also the one brain that never passed through
+    :func:`build_initial_context`, and so never heard how the surface it is
+    speaking into renders a reply: no tables and no charts on the dashboard, no
+    length rules on Telegram. The formatting section is appended here, at the
+    branch that skips the other path, so both teach it exactly once.
+    """
+    return "\n\n".join(
+        (
+            binding.agent_identity_context(
+                bound.agent_slug, user_id, bound.instructions, bound.label
+            ),
+            platform_formatting(platform),
+        )
+    )
 
 
 def _resolve_conversation(
@@ -233,21 +376,32 @@ def _resolve_conversation(
     A session without a ``user_id`` gets no conversation: the store is keyed by
     owner, and a transcript nobody owns can neither be listed nor authorized.
     Such a session behaves exactly as it did before this feature.
+
+    A requested conversation that no longer exists falls through to a new one
+    rather than resurrecting the id as an empty, meta-less directory. Callers
+    can now hold an id across a restart (ARCH-101), so "deleted since" is a
+    normal outcome and not a reason to strand the chat.
     """
     if not spec.user_id:
         return "", ""
 
     try:
-        if spec.conversation_id:
-            conversations.update_meta(
-                spec.user_id,
-                spec.conversation_id,
-                agent_key=agent_key,
-                agent_slug=agent_slug,
-                server_name=server_name,
-            )
+        if spec.conversation_id and conversations.update_meta(
+            spec.user_id,
+            spec.conversation_id,
+            agent_key=agent_key,
+            agent_slug=agent_slug,
+            server_name=server_name,
+        ):
             return spec.conversation_id, conversations.replay_context(
                 spec.user_id, spec.conversation_id
+            )
+
+        if spec.conversation_id:
+            log.info(
+                "Conversation %s is gone; %s starts a new one",
+                spec.conversation_id,
+                key,
             )
 
         meta = conversations.new_conversation(
@@ -256,6 +410,15 @@ def _resolve_conversation(
             agent_key=agent_key,
             agent_slug=agent_slug,
             server_name=server_name,
+            # Whether anyone but the owner can speak into this transcript. On
+            # Telegram the key's owner is the *chat*, so a chat id that is not
+            # the user's own id is a group: the session is one, its turns are
+            # recorded under whoever opened it, and nothing downstream could
+            # tell them apart afterwards. Recorded here so the sweep can refuse
+            # it rather than trusting a guard in another module (FEAT-055).
+            multi_author=bool(
+                spec.chat_id is not None and spec.chat_id != spec.user_id
+            ),
         )
         return meta.id, ""
     except Exception:  # noqa: BLE001 - a chat must start even if recording fails
@@ -278,6 +441,25 @@ async def get_or_create_session(
     """
     key = SessionKey.parse(spec.key)
     raw_key = str(key)
+
+    # One creation at a time per key (CORR-187): the second concurrent caller
+    # waits here and then finds the first caller's session in the registry
+    # instead of spawning a duplicate whose twin would leak until shutdown.
+    # Locks are per key, so creations under different keys stay concurrent.
+    async with _creation_lock(raw_key):
+        return await _get_or_create_session_locked(
+            spec, key, raw_key, permission_callback, user_data
+        )
+
+
+async def _get_or_create_session_locked(
+    spec: SessionSpec,
+    key: SessionKey,
+    raw_key: str,
+    permission_callback: PermissionCallback | None,
+    user_data: dict | None,
+) -> AgentSession:
+    """Body of :func:`get_or_create_session`; runs under the per-key lock."""
     session = _sessions.get(raw_key)
 
     # Reuse existing session only if the same brain is still on the other end:
@@ -305,19 +487,55 @@ async def get_or_create_session(
     # Destroy old session if exists
     if session:
         await _destroy_session_internal(key)
-    elif spec.user_id:
-        # Only a genuinely new key counts against the budget — replacing the
-        # session behind an existing key is a swap, not an extra subprocess.
-        await _enforce_session_budget(spec.user_id)
 
+    if spec.user_id:
+        if session is None:
+            # Only a genuinely new key counts against the budget — replacing
+            # the session behind an existing key is a swap, not an extra
+            # subprocess.
+            await _enforce_session_budget(spec.user_id, key.surface)
+        # Reserve this key's budget slot for the whole spawn. The reservation
+        # must follow the check with no await in between — the event loop
+        # makes the pair atomic, so two creates can never both pass the count
+        # before either reserves (and _enforce_session_budget recounts after
+        # every await it does make). The swap path reserves too: its old
+        # session is already out of the registry, so a concurrent create
+        # would otherwise undercount during the respawn window.
+        _pending_creates.setdefault(spec.user_id, set()).add(raw_key)
+        try:
+            return await _spawn_session(
+                spec, key, raw_key, permission_callback, user_data
+            )
+        finally:
+            reserved = _pending_creates.get(spec.user_id)
+            if reserved is not None:
+                reserved.discard(raw_key)
+                if not reserved:
+                    del _pending_creates[spec.user_id]
+
+    return await _spawn_session(spec, key, raw_key, permission_callback, user_data)
+
+
+async def _spawn_session(
+    spec: SessionSpec,
+    key: SessionKey,
+    raw_key: str,
+    permission_callback: PermissionCallback | None,
+    user_data: dict | None,
+) -> AgentSession:
+    """Spawn, contextualize, and register a new session for ``raw_key``.
+
+    Runs under the per-key creation lock, with the key's budget slot already
+    reserved when the spec names a user.
+    """
     # MCP subprocess env expects a numeric chat id; surfaces without a chat
-    # (web, mcp) fall back to the user id.
-    effective_chat_id = (
-        spec.chat_id if spec.chat_id is not None else (spec.user_id or 0)
-    )
+    # (web, mcp) fall back to the user id. The same pair goes down on argv via
+    # binding.resolve, which is what the subprocess actually reads first — so
+    # both channels take it from one derivation (SEC-180).
+    effective_user_id, effective_chat_id = spec.effective_ids()
     extra_env = {
         "CONDOR_CHAT_ID": str(effective_chat_id),
-        "CONDOR_USER_ID": str(spec.user_id or effective_chat_id),
+        "CONDOR_USER_ID": str(effective_user_id),
         # Which session the MCP subprocess belongs to. The *conversation* id does
         # not exist yet here (it is minted below, after the client is up), but the
         # key does and is stable for the subprocess's whole life — so tools that
@@ -334,84 +552,40 @@ async def get_or_create_session(
     mcp_servers = bound.mcp_servers
     agent_key = bound.agent_key or spec.agent_key
 
-    # Check if agent_key requires PydanticAI client (ollama, lmstudio, openai, etc.)
-    use_pydantic_ai = is_pydantic_ai_model(agent_key)
+    # One factory decides PydanticAI vs ACP for every surface (ARCH-192).
+    # Chat-session specifics: the CONDOR_* env pair, the bound-Agent identity
+    # header (system level — the opening context below is a user turn and loses
+    # to the host's own system prompt, FEAT-025), the saved LM Studio pref as
+    # the *default* base URL (a named custom endpoint still wins), and
+    # strict_custom_endpoint=True so a key naming an unsaved endpoint fails
+    # loudly with the guided RuntimeError instead of dying deep in httpx.
+    import os
 
-    if use_pydantic_ai:
-        # For Pydantic AI models: auto-detect or use configured filter mode
-        import os
+    from condor.preferences import get_agent_prefs
+    from condor.runtime.llm_client import build_llm_client
 
-        from condor.preferences import get_agent_prefs
-
-        # Priority: user preference > env variable > auto-detect (None)
-        agent_prefs = get_agent_prefs(user_data) if user_data else {}
-        tool_filter_mode = (
-            agent_prefs.get("tool_filter_mode")
-            or os.environ.get("PYDANTIC_AI_TOOL_FILTER")
-            or None  # None triggers auto-detection based on model size
-        )
-
-        base_url = (
+    agent_prefs = get_agent_prefs(user_data) if user_data else {}
+    client = build_llm_client(
+        agent_key,
+        mcp_servers=mcp_servers,
+        permission_callback=permission_callback,
+        # A bound Agent's allowlist is enforced here exactly as it is on
+        # consult and loop, so an Agent has the same reach in every mode.
+        allowed_tools=bound.tools or None,
+        extra_env=extra_env,
+        system_prompt=(
+            agent_identity_header(bound.agent_slug, bound.label)
+            if bound.is_agent
+            else ""
+        ),
+        user_data=user_data,
+        user_id=spec.user_id,
+        default_base_url=(
             agent_prefs.get("base_url") or os.environ.get("LMSTUDIO_BASE_URL") or None
-        )
-
-        api_key = None
-        if model_prefix(agent_key) == "custom":
-            # Custom OpenAI-compatible provider. The agent key names one of the
-            # user's saved endpoints ("custom@venice:..."); those live in the
-            # shared preference store so Telegram and the web dashboard resolve
-            # them identically. CUSTOM_LLM_* env vars cover headless deploys.
-            from condor.preferences import find_custom_provider, parse_custom_agent_key
-
-            provider_name, _ = parse_custom_agent_key(agent_key)
-            provider = (
-                find_custom_provider(user_data, provider_name) if user_data else None
-            )
-            if provider is None and provider_name:
-                raise RuntimeError(
-                    f"No saved endpoint named '{provider_name}'. Add it via "
-                    "/agent → Change LLM → Custom endpoint, or Settings → "
-                    "AI Providers on the web dashboard."
-                )
-            provider = provider or {}
-            base_url = provider.get("base_url") or os.environ.get("CUSTOM_LLM_BASE_URL")
-            api_key = provider.get("api_key") or os.environ.get("CUSTOM_LLM_API_KEY")
-
-        client = PydanticAIClient(
-            model=agent_key,
-            mcp_servers=mcp_servers,
-            permission_callback=permission_callback,
-            extra_env=extra_env,
-            tool_filter_mode=tool_filter_mode,  # Auto-detects if None
-            base_url=base_url,
-            api_key=api_key,
-            # A bound Agent's allowlist is enforced here exactly as it is on
-            # consult and loop, so an Agent has the same reach in every mode.
-            allowed_tools=bound.tools or None,
-        )
-    else:
-        # For ACP subprocess models: claude-code, gemini, codex.
-        # A Claude model can be pinned via a suffix, e.g. "claude-acp:opus" /
-        # "claude-acp:sonnet"; ACPClient selects it via session/set_model after
-        # handshake (the bridge ignores ANTHROPIC_MODEL). Bare key = agent default.
-        command, model_env, model_pref = resolve_acp(agent_key)
-        client = ACPClient(
-            command=command,
-            working_dir=get_project_dir(),
-            mcp_servers=mcp_servers,
-            permission_callback=permission_callback,
-            extra_env={**extra_env, **model_env},
-            model=model_pref,
-            # Who this brain IS, at system level. The opening context below is a
-            # user turn: it is read once and then loses to the host's own system
-            # prompt, which is why a bound Agent kept answering as Condor
-            # (FEAT-025). This is the one channel that outranks it.
-            system_prompt=(
-                agent_identity_header(bound.agent_slug, bound.label)
-                if bound.is_agent
-                else ""
-            ),
-        )
+        ),
+        tool_filter_mode=agent_prefs.get("tool_filter_mode"),
+        strict_custom_endpoint=True,
+    )
 
     await client.start()
 
@@ -421,9 +595,7 @@ async def get_or_create_session(
         # the chat's — that is what makes it a different brain, not a skin.
         initial_context = ""
         if bound.is_agent and spec.user_id:
-            initial_context = binding.agent_identity_context(
-                bound.agent_slug, spec.user_id, bound.instructions, bound.label
-            )
+            initial_context = bound_agent_context(bound, spec.user_id, spec.platform)
         elif spec.user_id:
             initial_context = build_initial_context(
                 spec.user_id,
@@ -433,16 +605,30 @@ async def get_or_create_session(
                 platform=spec.platform,
                 server_name=spec.server_name,
             )
-        # Resolve the server name that was actually used for this session
-        resolved_server = spec.server_name
-        if not resolved_server and spec.user_id:
-            from config_manager import get_config_manager, get_effective_server
+        # Resolve the server name that was actually used for this session. The
+        # chat default is the ambient answer, but ``chat_defaults`` is a global
+        # map keyed by chat id and ``spec`` is an unvalidated request body on
+        # the web, so naming someone else's chat would otherwise resolve their
+        # server here (SEC-178). Every candidate is therefore held to existence
+        # *and* reach, subjected on the run's own principal — the same id the
+        # MCP toolset is built for, so the label and the credentials downstream
+        # can never disagree about who this session belongs to.
+        from config_manager import get_config_manager, get_effective_server
 
+        cm = get_config_manager()
+        subject_id, _ = spec.effective_ids()
+
+        def usable(name: str | None) -> bool:
+            return bool(name and cm.get_server(name)) and cm.has_server_access(
+                subject_id, name
+            )
+
+        resolved_server = spec.server_name
+        if not usable(resolved_server):
             resolved_server = get_effective_server(spec.chat_id, user_data)
-            if not resolved_server:
-                cm = get_config_manager()
-                accessible = cm.get_accessible_servers(spec.user_id)
-                resolved_server = accessible[0] if accessible else None
+        if not usable(resolved_server):
+            accessible = cm.get_accessible_servers(subject_id)
+            resolved_server = accessible[0] if accessible else None
 
         # The durable conversation behind this session. An empty id mints a new
         # one; a supplied id replays that transcript's tail into the opening
@@ -517,6 +703,7 @@ async def destroy_session(key: SessionKey) -> bool:
 
 async def _destroy_session_internal(key: SessionKey) -> bool:
     raw_key = str(key)
+    _deny_pending_confirmations(raw_key)
     session = _sessions.pop(raw_key, None)
     if session:
         try:
@@ -562,36 +749,80 @@ async def stop_health_monitor() -> None:
 
 
 async def _health_check_loop() -> None:
-    """Every 15s, check for dead sessions (including stuck ones with is_busy=True)."""
+    """Every 15s, sweep the registry once."""
     try:
         while True:
             await asyncio.sleep(15)
-            dead_keys: list[SessionKey] = []
-            for raw_key, session in list(_sessions.items()):
-                if not session.client.alive:
-                    if session.is_busy:
-                        # Force-clear stuck busy flag on dead sessions
-                        session.is_busy = False
-                        log.warning(
-                            "Health monitor: force-cleared is_busy for dead session %s",
-                            raw_key,
-                        )
-                    dead_keys.append(session.key)
-
-            for key in dead_keys:
-                log.warning("Health monitor: dead session %s, cleaning up", key)
-                await _destroy_session_internal(key)
-                # Only Telegram sessions have a chat to notify.
-                chat_id = key.telegram_chat_id
-                if _health_bot and chat_id is not None:
-                    try:
-                        await _health_bot.send_message(
-                            chat_id=chat_id,
-                            text="Agent session ended unexpectedly. Send a message to start a new session.",
-                        )
-                    except Exception:
-                        log.warning(
-                            "Failed to notify chat %s about dead session", chat_id
-                        )
+            await _sweep_sessions()
     except asyncio.CancelledError:
         pass
+
+
+async def _sweep_sessions() -> None:
+    """One health pass: reap the dead sessions, detach the idle ones.
+
+    Two questions of the same registry, so one scan asks both rather than a
+    second task asking the second — but they mean different things and are
+    deliberately said differently. A dead subprocess is a fault, and the
+    Telegram chat behind it is told so. An idle session is not a fault
+    (PERF-226): it is a conversation nobody came back to, still holding an
+    agent subprocess, the MCP tree it was spawned with, and one of the five
+    slots in ``MAX_SESSIONS_PER_USER``. Since FEAT-015 the conversation
+    outlives the subprocess, so retiring one is a detach the next message
+    reattaches — silently, like the LRU's same-surface detach.
+
+    Both go out through ``_destroy_session_internal``, the one funnel that also
+    denies whatever the session was still asking a human to approve.
+    """
+    ttl = TIMEOUTS.session_idle
+    now = _utcnow()
+    dead_keys: list[SessionKey] = []
+    # (key, conversation id, seconds idle) — captured during the scan, because
+    # the session is gone from the registry by the time it is logged.
+    idle: list[tuple[SessionKey, str, float]] = []
+
+    for raw_key, session in list(_sessions.items()):
+        if not session.client.alive:
+            if session.is_busy:
+                # Force-clear stuck busy flag on dead sessions
+                session.is_busy = False
+                log.warning(
+                    "Health monitor: force-cleared is_busy for dead session %s",
+                    raw_key,
+                )
+            dead_keys.append(session.key)
+            continue
+        # A session mid-turn is never idle, however old its timestamp is:
+        # ``last_prompt_at`` is stamped when the turn *starts*, so a long
+        # answer would otherwise reap the subprocess writing it.
+        if not ttl or session.is_busy:
+            continue
+        since = session.last_prompt_at or session.created_at
+        seconds = (now - since).total_seconds()
+        if seconds > ttl:
+            idle.append((session.key, session.conversation_id, seconds))
+
+    for key in dead_keys:
+        log.warning("Health monitor: dead session %s, cleaning up", key)
+        await _destroy_session_internal(key)
+        # Only Telegram sessions have a chat to notify.
+        chat_id = key.telegram_chat_id
+        if _health_bot and chat_id is not None:
+            try:
+                await _health_bot.send_message(
+                    chat_id=chat_id,
+                    text="Agent session ended unexpectedly. Send a message to start a new session.",
+                )
+            except Exception:
+                log.warning("Failed to notify chat %s about dead session", chat_id)
+
+    for key, conversation_id, seconds in idle:
+        log.info(
+            "Health monitor: session %s idle for %.0fs (over the %ss TTL), "
+            "detaching (conversation %s is kept)",
+            key,
+            seconds,
+            ttl,
+            conversation_id or "none",
+        )
+        await _destroy_session_internal(key)

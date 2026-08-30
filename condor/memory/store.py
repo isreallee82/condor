@@ -22,13 +22,11 @@ Each store lives under its assistant's home, keyed by ``user_id`` (FEAT-003);
 from __future__ import annotations
 
 import json
-import os
-import re
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
+from condor.frontmatter import parse_frontmatter, render_frontmatter, slugify
+from condor.fsutil import atomic_write_text
 
 from .paths import store_root
 
@@ -41,40 +39,13 @@ _AUDIT_CAP = 500
 
 
 def _slugify(name: str) -> str:
-    """Convert a memory name to a filesystem-safe slug."""
-    s = name.lower().strip()
-    s = re.sub(r"[^\w\s-]", "", s)
-    s = re.sub(r"[\s-]+", "_", s)
-    return s.strip("_") or "memory"
+    """Slug with this store's historical ``"memory"`` fallback.
 
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter and markdown body (mirrors strategy.py)."""
-    text = text.strip()
-    if not text.startswith("---"):
-        return {}, text
-
-    end = text.find("---", 3)
-    if end == -1:
-        return {}, text
-
-    frontmatter_str = text[3:end].strip()
-    body = text[end + 3 :].strip()
-
-    try:
-        meta = yaml.safe_load(frontmatter_str) or {}
-    except yaml.YAMLError:
-        meta = {}
-
-    return meta, body
-
-
-def _render(meta: dict, body: str) -> str:
-    """Render YAML frontmatter + markdown body."""
-    frontmatter = yaml.dump(
-        meta, default_flow_style=False, allow_unicode=True, sort_keys=False
-    ).strip()
-    return f"---\n{frontmatter}\n---\n\n{body}\n"
+    Thin binding over :func:`condor.frontmatter.slugify` (ARCH-202) so
+    memories and skills alike keep resolving empty/all-punctuation names to
+    the same on-disk slug they always have.
+    """
+    return slugify(name, fallback="memory")
 
 
 def _utcnow() -> str:
@@ -109,22 +80,15 @@ def _atomic_write(path: Path, text: str) -> None:
 
     Free function (not a method) so every per-assistant store — memories and
     skills alike — shares one implementation instead of a verbatim copy. The
-    temp file is named uniquely per writer (pid + uuid) so two processes
-    writing the same slug concurrently never share — and thus never tear — the
-    temp file; ``os.replace`` then publishes each writer's complete file
-    atomically (FEAT-003 runs the same store from the main process and the MCP
-    subprocess).
+    temp file is unique per writer, so two processes writing the same slug
+    concurrently never share — and thus never tear — it; ``os.replace`` then
+    publishes each writer's complete file atomically (FEAT-003 runs the same
+    store from the main process and the MCP subprocess).
+
+    Thin alias over :func:`condor.fsutil.atomic_write_text`, which is the one
+    implementation of this dance in the codebase (ARCH-148).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(text)
-        os.replace(tmp, path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_text(path, text)
 
 
 def _trim_audit(audit_file: Path, cap: int | None = None) -> None:
@@ -146,17 +110,7 @@ def _trim_audit(audit_file: Path, cap: int | None = None) -> None:
     if len(lines) <= cap * 2:
         return
     tail = lines[-cap:]
-    tmp = audit_file.with_name(
-        f".{audit_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
-    try:
-        tmp.write_text("".join(tail))
-        os.replace(tmp, audit_file)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+    _atomic_write(audit_file, "".join(tail))
 
 
 class MemoryStore:
@@ -204,7 +158,7 @@ class MemoryStore:
         existed = path.exists()
         created = _utcnow()
         if existed:
-            existing_meta, _ = _parse_frontmatter(path.read_text())
+            existing_meta, _ = parse_frontmatter(path.read_text())
             created = existing_meta.get("created", created)
 
         meta = {
@@ -214,7 +168,7 @@ class MemoryStore:
             "created": created,
             "source": source,
         }
-        _atomic_write(path, _render(meta, content.strip()))
+        _atomic_write(path, render_frontmatter(meta, content.strip()))
         self._reindex()
         action = "update" if existed else "create"
         self._append_audit(action, f"memory:{slug}", meta["description"], source)
@@ -230,7 +184,7 @@ class MemoryStore:
         path = self.memories_dir / f"{_slugify(name)}.md"
         if not path.exists():
             return None
-        _, body = _parse_frontmatter(path.read_text())
+        _, body = parse_frontmatter(path.read_text())
         return body
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
@@ -278,7 +232,7 @@ class MemoryStore:
         path = self.memories_dir / f"{slug}.md"
         if not path.exists():
             return False
-        meta, _ = _parse_frontmatter(path.read_text())
+        meta, _ = parse_frontmatter(path.read_text())
         path.unlink()
         self._reindex()
         self._append_audit(
@@ -312,7 +266,7 @@ class MemoryStore:
         parsed = []
         for f in files:
             try:
-                meta, body = _parse_frontmatter(f.read_text())
+                meta, body = parse_frontmatter(f.read_text())
             except Exception:
                 continue
             meta.setdefault("name", f.stem)

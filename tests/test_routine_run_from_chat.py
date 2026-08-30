@@ -213,6 +213,39 @@ def test_continuous_start_is_registered_in_the_main_process(project, monkeypatch
     assert out == {"started": True, "instance_id": "inst-1", "routine": "watcher"}
 
 
+def test_start_attributes_a_targeted_routine_to_its_owning_agent(project, monkeypatch):
+    """ARCH-218: ``start`` resolves an owner exactly as ``run`` does.
+
+    Starting a continuous routine and running a one-shot ask the same question —
+    "who is this run for?" — so from the chat's seat both must stamp the targeted
+    library's owner, not the caller.
+    """
+    import condor.agents.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_DATA_ROOT", project / "agents")
+    (project / "agents" / "scout" / "AGENT.md").write_text("---\nname: Scout\n---\n")
+    api = _api(monkeypatch)
+
+    out = asyncio.run(mcp_routines.manage_routines("start", "watcher", agent="scout"))
+
+    assert api.posted["routine_name"] == "scout/watcher"
+    assert api.posted["attribute_to"] == "scout"
+    assert out["started"] is True
+
+
+def test_start_without_a_target_still_attributes_to_the_chat(project, monkeypatch):
+    """The default is byte-identical to before the owner resolution existed."""
+    api = _api(monkeypatch)
+    watcher = routines_base.discover_routines_from_path(
+        project / "agents" / "scout" / "routines", agent_slug="scout"
+    )["watcher"]
+    monkeypatch.setattr(mcp_routines, "_resolve_routine", lambda name: watcher)
+
+    asyncio.run(mcp_routines.start_routine("watcher", {}))
+
+    assert api.posted["attribute_to"] == "condor"
+
+
 def test_start_rejects_a_one_shot_routine(project, monkeypatch):
     monkeypatch.setattr(mcp_routines.settings, "agent_slug", "scout")
     api = _api(monkeypatch)
@@ -255,3 +288,118 @@ def test_manage_routines_awaits_the_delegated_actions(project, monkeypatch):
 
     assert asyncio.run(mcp_routines.manage_routines("stop", "inst-1"))["stopped"]
     assert "instances" in asyncio.run(mcp_routines.manage_routines("list_instances"))
+
+
+# ── run_async / get_instance: submit now, read the result later ──
+
+
+def test_run_async_returns_without_waiting_for_the_run(project, monkeypatch):
+    """The point of the action: a slow routine must not hold up the caller, so
+    submitting it makes exactly one call and never polls the instance."""
+    monkeypatch.setattr(mcp_routines.settings, "agent_slug", "scout")
+    api = _api(monkeypatch)
+
+    out = asyncio.run(mcp_routines.run_async_routine("probe", {}))
+
+    assert api.calls == [
+        (
+            "POST",
+            "/routines/run",
+            {
+                "routine_name": "scout/probe",
+                "server_name": "srv",
+                "config": {},
+                "attribute_to": "scout",
+            },
+        )
+    ]
+    assert out["started"] is True
+    assert out["instance_id"] == "inst-1"
+    assert "get_instance" in out["note"]
+
+
+def test_run_async_validates_before_submitting(project, monkeypatch):
+    """It shares ``run``'s guards — a bad config must not become a live run."""
+    monkeypatch.setattr(mcp_routines.settings, "agent_slug", "scout")
+    api = _api(monkeypatch)
+
+    bad_config = asyncio.run(mcp_routines.run_async_routine("typed", {"limit": "no"}))
+    continuous = asyncio.run(mcp_routines.run_async_routine("watcher", {}))
+    missing = asyncio.run(mcp_routines.run_async_routine("nope", {}))
+
+    assert "Invalid config" in bad_config["error"]
+    assert "start" in continuous["error"]
+    assert "not found" in missing["error"]
+    assert api.calls == []
+
+
+def test_get_instance_returns_the_finished_result(project, monkeypatch):
+    api = _api(
+        monkeypatch,
+        instance={
+            "status": "completed",
+            "routine_name": "scout/probe",
+            "result_text": "done",
+            "report_id": "rep-9",
+            "has_chart": True,
+        },
+    )
+
+    out = asyncio.run(mcp_routines.get_instance("inst-1"))
+
+    assert api.calls == [("GET", "/routines/instances/inst-1", None)]
+    assert out["status"] == "completed"
+    assert out["result"]["text"] == "done"
+    assert out["result"]["chart_image"] == "(PNG bytes, view via dashboard)"
+    assert out["report_id"] == "rep-9"
+
+
+def test_get_instance_reports_a_run_still_in_flight(project, monkeypatch):
+    """Polling early must read as "not done yet", never as an empty result."""
+    _api(monkeypatch, instance={"status": "running", "routine_name": "scout/probe"})
+
+    out = asyncio.run(mcp_routines.get_instance("inst-1"))
+
+    assert out["status"] == "running"
+    assert "result" not in out
+
+
+def test_get_instance_surfaces_a_failed_run(project, monkeypatch):
+    _api(
+        monkeypatch,
+        instance={
+            "status": "failed",
+            "routine_name": "scout/probe",
+            "error": "ValueError: boom",
+        },
+    )
+
+    out = asyncio.run(mcp_routines.get_instance("inst-1"))
+
+    assert "ValueError: boom" in out["error"]
+    assert out["instance_id"] == "inst-1"
+
+
+def test_get_instance_explains_a_dropped_instance(project, monkeypatch):
+    """Instances are in-memory: after a restart the id is gone, and the message
+    has to say so rather than look like the routine produced nothing."""
+    _api(monkeypatch, raises=APIError("API error (404): Instance not found"))
+
+    out = asyncio.run(mcp_routines.get_instance("inst-1"))
+
+    assert "restart" in out["error"]
+    assert "list_instances" in out["error"]
+
+
+def test_manage_routines_dispatches_the_new_actions(project, monkeypatch):
+    _api(monkeypatch, instance={"status": "completed", "result_text": "done"})
+
+    submitted = asyncio.run(mcp_routines.manage_routines("run_async", "global_probe"))
+    read_back = asyncio.run(mcp_routines.manage_routines("get_instance", "inst-1"))
+
+    assert submitted["instance_id"] == "inst-1"
+    assert read_back["result"]["text"] == "done"
+    assert "required" in asyncio.run(mcp_routines.manage_routines("run_async"))["error"]
+    assert (
+        "required" in asyncio.run(mcp_routines.manage_routines("get_instance"))["error"]
+    )

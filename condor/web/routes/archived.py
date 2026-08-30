@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from config_manager import get_config_manager
-from condor.web.auth import get_current_user
+from condor.fetchers.executors import normalize_executor_side
+from condor.web.auth import require_server_access
 from condor.web.models import (
     ArchivedBotPerformance,
     ArchivedBotSummary,
@@ -17,15 +18,42 @@ from condor.web.models import (
     PnlPoint,
     WebUser,
 )
+from config_manager import get_config_manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["archived"])
 
-# Module-level cache for archived data (immutable, no TTL needed)
-# Key: (server_name, db_path) -> cached result
-_performance_cache: dict[tuple[str, str], ArchivedBotPerformance] = {}
-_executors_cache: dict[tuple[str, str], list[NormalizedExecutor]] = {}
+# Module-level LRU cache for archived data (immutable per db_path, so no TTL —
+# but bounded, since each entry holds up to ~5000 PnL points plus the full
+# executor list and a long-lived process would otherwise grow without ceiling).
+# Key: (server_name, db_path) -> cached result. Executors live only inside the
+# performance entry; the executors route pages out of it.
+_PERFORMANCE_CACHE_MAX = 32
+_performance_cache: OrderedDict[tuple[str, str], ArchivedBotPerformance] = OrderedDict()
+
+# In-flight fetches keyed like the cache, so concurrent cold-cache requests for
+# the same archived bot share one backend walk (same idiom as
+# condor.pool_data._single_flight).
+_performance_inflight: dict[tuple[str, str], "asyncio.Task[ArchivedBotPerformance]"] = (
+    {}
+)
+
+
+def _cache_get(cache_key: tuple[str, str]) -> ArchivedBotPerformance | None:
+    """Return the cached entry, marking it most-recently-used."""
+    perf = _performance_cache.get(cache_key)
+    if perf is not None:
+        _performance_cache.move_to_end(cache_key)
+    return perf
+
+
+def _cache_put(cache_key: tuple[str, str], perf: ArchivedBotPerformance) -> None:
+    """Store an entry, evicting the least-recently-used past the cap."""
+    _performance_cache[cache_key] = perf
+    _performance_cache.move_to_end(cache_key)
+    while len(_performance_cache) > _PERFORMANCE_CACHE_MAX:
+        _performance_cache.popitem(last=False)
 
 
 def _extract_bot_name(db_path: str) -> str:
@@ -59,22 +87,13 @@ async def _get_bot_summary(client: Any, db_path: str) -> ArchivedBotSummary | No
         return None
 
 
-def _normalize_side(raw_side: Any) -> str:
-    """Normalize side value from int/string variants."""
-    s = str(raw_side).strip().upper()
-    if s in ("1", "BUY", "LONG"):
-        return "BUY"
-    if s in ("2", "SELL", "SHORT"):
-        return "SELL"
-    return s
-
-
 def _parse_json_field(val: Any) -> dict:
     """Parse a field that may be a JSON string or already a dict."""
     if isinstance(val, dict):
         return val
     if isinstance(val, str) and val.strip().startswith("{"):
         import json
+
         try:
             return json.loads(val)
         except Exception:
@@ -114,10 +133,7 @@ def _normalize_executors(raw: list[dict]) -> list[NormalizedExecutor]:
         )
 
         # Resolve trading pair
-        trading_pair = str(
-            ex.get("trading_pair", "")
-            or config.get("trading_pair", "")
-        )
+        trading_pair = str(ex.get("trading_pair", "") or config.get("trading_pair", ""))
 
         # Resolve prices
         entry_price = float(
@@ -138,26 +154,32 @@ def _normalize_executors(raw: list[dict]) -> list[NormalizedExecutor]:
         volume = float(ex.get("filled_amount_quote", 0) or ex.get("volume", 0) or 0)
         net_pnl_pct = float(ex.get("net_pnl_pct", 0) or 0)
 
-        result.append(NormalizedExecutor(
-            id=str(ex.get("id", "") or ex.get("executor_id", "")),
-            type=str(ex.get("type", "") or ex.get("executor_type", "") or config.get("type", "position")),
-            connector=connector,
-            trading_pair=trading_pair,
-            side=_normalize_side(side_raw),
-            status=str(ex.get("status", "") or "closed"),
-            close_type=str(ex.get("close_type", "") or ""),
-            pnl=pnl,
-            volume=volume,
-            timestamp=_to_epoch_seconds(ex.get("timestamp")),
-            close_timestamp=_to_epoch_seconds(ex.get("close_timestamp")),
-            entry_price=entry_price,
-            current_price=close_price,
-            cum_fees_quote=fees,
-            net_pnl_pct=net_pnl_pct,
-            controller_id=str(ex.get("controller_id", "")),
-            custom_info=custom_info,
-            config=config,
-        ))
+        result.append(
+            NormalizedExecutor(
+                id=str(ex.get("id", "") or ex.get("executor_id", "")),
+                type=str(
+                    ex.get("type", "")
+                    or ex.get("executor_type", "")
+                    or config.get("type", "position")
+                ),
+                connector=connector,
+                trading_pair=trading_pair,
+                side=normalize_executor_side(side_raw),
+                status=str(ex.get("status", "") or "closed"),
+                close_type=str(ex.get("close_type", "") or ""),
+                pnl=pnl,
+                volume=volume,
+                timestamp=_to_epoch_seconds(ex.get("timestamp")),
+                close_timestamp=_to_epoch_seconds(ex.get("close_timestamp")),
+                entry_price=entry_price,
+                current_price=close_price,
+                cum_fees_quote=fees,
+                net_pnl_pct=net_pnl_pct,
+                controller_id=str(ex.get("controller_id", "")),
+                custom_info=custom_info,
+                config=config,
+            )
+        )
     return result
 
 
@@ -187,12 +209,36 @@ def _derive_primary_pair(
 async def _fetch_and_cache_performance(
     client: Any, name: str, db_path: str
 ) -> ArchivedBotPerformance:
-    """Fetch full performance data and cache it."""
+    """Return cached performance data, coalescing concurrent cold-cache fetches.
+
+    The fetch runs as a detached task and awaiters ``shield`` it, so one caller
+    navigating away and cancelling their request cannot also cancel the fetch
+    the remaining callers are waiting on.
+    """
     cache_key = (name, db_path)
 
-    # Check cache first
-    if cache_key in _performance_cache:
-        return _performance_cache[cache_key]
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    task = _performance_inflight.get(cache_key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_fetch_performance(client, name, db_path))
+        _performance_inflight[cache_key] = task
+
+        def _clear(finished: "asyncio.Task", _key: tuple[str, str] = cache_key) -> None:
+            if _performance_inflight.get(_key) is finished:
+                _performance_inflight.pop(_key, None)
+
+        task.add_done_callback(_clear)
+    return await asyncio.shield(task)
+
+
+async def _fetch_performance(
+    client: Any, name: str, db_path: str
+) -> ArchivedBotPerformance:
+    """Fetch full performance data from the backend and cache it."""
+    cache_key = (name, db_path)
 
     # Fetch summary
     try:
@@ -242,14 +288,13 @@ async def _fetch_and_cache_performance(
     # Normalize executors to consistent field names
     executors = _normalize_executors(raw_executors)
 
-    # Cache executors separately for pagination
-    _executors_cache[cache_key] = executors
-
     # Derive primary connector and trading pair
-    primary_connector, primary_trading_pair = _derive_primary_pair(executors, exchanges, trading_pairs)
+    primary_connector, primary_trading_pair = _derive_primary_pair(
+        executors, exchanges, trading_pairs
+    )
 
     # Calculate PnL from trades
-    from handlers.bots.archived_chart import calculate_pnl_from_trades
+    from condor.archived_pnl import calculate_pnl_from_trades
 
     pnl_data = calculate_pnl_from_trades(all_trades)
 
@@ -306,16 +351,14 @@ async def _fetch_and_cache_performance(
         executor_count=len(executors),
     )
 
-    # Cache full result
-    _performance_cache[cache_key] = result
+    # Cache full result (executors included — the executors route pages out of it)
+    _cache_put(cache_key, result)
     return result
 
 
 @router.get("/servers/{name}/archived")
-async def list_archived_bots(name: str, user: WebUser = Depends(get_current_user)):
+async def list_archived_bots(name: str, user: WebUser = Depends(require_server_access)):
     cm = get_config_manager()
-    if not cm.has_server_access(user.id, name):
-        raise HTTPException(status_code=403, detail="No access")
 
     client = await cm.get_client(name)
 
@@ -351,16 +394,18 @@ async def list_archived_bots(name: str, user: WebUser = Depends(get_current_user
     return {"bots": bots}
 
 
-@router.get("/servers/{name}/archived/performance", response_model=ArchivedBotPerformance)
+@router.get(
+    "/servers/{name}/archived/performance", response_model=ArchivedBotPerformance
+)
 async def get_archived_performance(
     name: str,
     db_path: str = Query(..., description="Database path"),
-    include_executors: bool = Query(False, description="Include full executor list in response"),
-    user: WebUser = Depends(get_current_user),
+    include_executors: bool = Query(
+        False, description="Include full executor list in response"
+    ),
+    user: WebUser = Depends(require_server_access),
 ):
     cm = get_config_manager()
-    if not cm.has_server_access(user.id, name):
-        raise HTTPException(status_code=403, detail="No access")
 
     client = await cm.get_client(name)
 
@@ -379,20 +424,20 @@ async def get_archived_executors(
     db_path: str = Query(..., description="Database path"),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
-    user: WebUser = Depends(get_current_user),
+    user: WebUser = Depends(require_server_access),
 ):
     cm = get_config_manager()
-    if not cm.has_server_access(user.id, name):
-        raise HTTPException(status_code=403, detail="No access")
 
     cache_key = (name, db_path)
 
-    # If executors not cached yet, trigger a full fetch
-    if cache_key not in _executors_cache:
+    # Page out of the cached performance entry; on a miss, trigger the full
+    # (single-flight) fetch.
+    perf = _cache_get(cache_key)
+    if perf is None:
         client = await cm.get_client(name)
-        await _fetch_and_cache_performance(client, name, db_path)
+        perf = await _fetch_and_cache_performance(client, name, db_path)
 
-    executors = _executors_cache.get(cache_key, [])
+    executors = perf.executors
     page = executors[offset : offset + limit]
 
     return PaginatedExecutors(

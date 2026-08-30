@@ -14,8 +14,9 @@ Storage:
 - Primary: config.yml via ConfigManager (shared across TG + Web)
 - Fallback: context.user_data pickle (for session-level state)
 
-When a user_data dict contains '_user_id', changes are synced to ConfigManager
-so the web dashboard can also read them.
+When a user_data dict contains '_user_id', setters sync the whole affected
+preference section to ConfigManager (via _sync_section_to_cm) so the web
+dashboard can also read them.
 """
 
 import logging
@@ -35,20 +36,6 @@ logger = logging.getLogger(__name__)
 def _get_user_id(user_data: Dict) -> Optional[int]:
     """Extract user_id from user_data if present."""
     return user_data.get("_user_id")
-
-
-def _sync_to_cm(user_data: Dict, key: str, value) -> None:
-    """Persist a preference to ConfigManager (config.yml) if user_id is known."""
-    user_id = _get_user_id(user_data)
-    if user_id is None:
-        return
-    try:
-        from config_manager import get_config_manager
-
-        cm = get_config_manager()
-        cm.set_user_preference(user_id, key, value)
-    except Exception as e:
-        logger.debug("Failed to sync preference '%s' to config: %s", key, e)
 
 
 def _sync_section_to_cm(user_data: Dict, section: str) -> None:
@@ -105,6 +92,12 @@ def _load_from_cm(user_data: Dict) -> None:
 USER_PREFERENCES_KEY = "user_preferences"
 _MIGRATION_DONE_KEY = "_prefs_migration_done"
 
+# Marks a ``user_data`` built *for* one server — a routine or agent run launched
+# against it — rather than a chat's own preferences. ``get_effective_server``
+# honours a pinned server outright; without the mark it treats ``active_server``
+# as a cache of the chat default and lets config.yml correct it.
+SERVER_PIN_KEY = "_server_pinned"
+
 # Portfolio defaults
 DEFAULT_PORTFOLIO_DAYS = 3
 DEFAULT_PORTFOLIO_INTERVAL = "1h"
@@ -124,7 +117,8 @@ DEFAULT_CLOB_AMOUNT = "$10"
 DEFAULT_DEX_NETWORK = "solana-mainnet-beta"
 DEFAULT_DEX_CONNECTOR = "jupiter"
 DEFAULT_DEX_PAIR = "SOL-USDC"
-DEFAULT_DEX_SLIPPAGE = "1.0"
+# No slippage default on purpose: an unset slippage is OMITTED from the Gateway request so the
+# connector's own configured slippage applies. An explicit value (including "0") is a real value.
 DEFAULT_DEX_SIDE = "BUY"
 DEFAULT_DEX_AMOUNT = "1.0"
 
@@ -189,16 +183,6 @@ class GeneralPrefs(TypedDict, total=False):
     active_server: Optional[str]
 
 
-class WalletNetworkPrefs(TypedDict, total=False):
-    """Network preferences for a specific wallet.
-
-    Keys are wallet addresses, values are lists of enabled network IDs.
-    Example: {"0x1234...": ["ethereum-mainnet", "base", "arbitrum"]}
-    """
-
-    pass  # Dynamic keys based on wallet addresses
-
-
 class GatewayPrefs(TypedDict, total=False):
     """Gateway-related preferences including wallet network settings."""
 
@@ -247,11 +231,36 @@ class CustomProviderPrefs(TypedDict, total=False):
     api_key: str
 
 
+class ChatBindingPrefs(TypedDict, total=False):
+    """What a chat is bound to, replayed every time its session respawns.
+
+    The live session is not durable — a bot restart, a health-monitor reap or an
+    LRU detach all destroy it — so anything the next session must be recreated
+    *with* is recorded here instead of only on the session object.
+
+    It is a record rather than a bare slug on purpose: identity is the first
+    thing a respawn has to replay, not the last (the conversation to resume is
+    the obvious next one), and each of those belongs beside the others rather
+    than as another loose top-level key.
+    """
+
+    # Slug of the specialist answering this chat. Absent/empty = Condor, the
+    # coordinator -- i.e. unbound, which is what clearing the binding restores.
+    agent_slug: str
+
+    # Durable conversation the chat is in. Replayed into every respawn, so a
+    # restart, a reap or an LRU detach resumes the transcript instead of
+    # orphaning it (ARCH-101). Absent/empty = the next spawn mints a fresh one,
+    # which is what the deliberate new-chat verbs restore.
+    conversation_id: str
+
+
 class AgentPrefs(TypedDict, total=False):
     default_agent: str  # "claude-code", "gemini", "codex", "copilot"
     show_tool_calls: bool  # Show tool call indicators (default True)
     tool_filter_mode: str  # "essential", "moderate", or "full" for PydanticAI models
     custom_providers: List[CustomProviderPrefs]  # OpenAI-compatible endpoints
+    chat_binding: ChatBindingPrefs  # who this chat talks to across respawns
     # Mirror of the live chat selection (user_data["agent_llm"]). Kept here so
     # code outside a PTB context — the MCP subprocess, web, background agent
     # runs — can see which model the user is actually on.
@@ -334,7 +343,6 @@ def _get_default_preferences() -> UserPreferences:
         "dex": {
             "default_network": DEFAULT_DEX_NETWORK,
             "default_connector": DEFAULT_DEX_CONNECTOR,
-            "default_slippage": DEFAULT_DEX_SLIPPAGE,
             "last_swap": {},
             "last_pool": {},
         },
@@ -542,30 +550,12 @@ def get_general_prefs(user_data: Dict) -> GeneralPrefs:
 # ============================================
 
 
-def get_portfolio_days(user_data: Dict) -> int:
-    """Get portfolio graph days setting"""
-    return get_portfolio_prefs(user_data).get("days", DEFAULT_PORTFOLIO_DAYS)
-
-
-def get_portfolio_interval(user_data: Dict) -> str:
-    """Get portfolio graph interval setting"""
-    return get_portfolio_prefs(user_data).get("interval", DEFAULT_PORTFOLIO_INTERVAL)
-
-
 def set_portfolio_days(user_data: Dict, days: int) -> None:
     """Set portfolio graph days"""
     prefs = _ensure_preferences(user_data)
     prefs["portfolio"]["days"] = days
     _sync_section_to_cm(user_data, "portfolio")
     logger.info(f"Set portfolio days to {days}")
-
-
-def set_portfolio_interval(user_data: Dict, interval: str) -> None:
-    """Set portfolio graph interval"""
-    prefs = _ensure_preferences(user_data)
-    prefs["portfolio"]["interval"] = interval
-    _sync_section_to_cm(user_data, "portfolio")
-    logger.info(f"Set portfolio interval to {interval}")
 
 
 # ============================================
@@ -576,19 +566,6 @@ def set_portfolio_interval(user_data: Dict, interval: str) -> None:
 def get_clob_account(user_data: Dict) -> str:
     """Get CLOB trading account"""
     return get_clob_prefs(user_data).get("account", DEFAULT_CLOB_ACCOUNT)
-
-
-def set_clob_account(user_data: Dict, account: str) -> None:
-    """Set CLOB trading account"""
-    prefs = _ensure_preferences(user_data)
-    prefs["clob"]["account"] = account
-    _sync_section_to_cm(user_data, "clob")
-    logger.info(f"Set CLOB account to {account}")
-
-
-def get_clob_last_order(user_data: Dict) -> CLOBOrderParams:
-    """Get last CLOB order parameters"""
-    return deepcopy(get_clob_prefs(user_data).get("last_order", {}))
 
 
 def set_clob_last_order(user_data: Dict, params: CLOBOrderParams) -> None:
@@ -658,9 +635,9 @@ def get_dex_connector(user_data: Dict, network: Optional[str] = None) -> str:
     return get_dex_prefs(user_data).get("default_connector", DEFAULT_DEX_CONNECTOR)
 
 
-def get_dex_slippage(user_data: Dict) -> str:
-    """Get default DEX slippage percentage"""
-    return get_dex_prefs(user_data).get("default_slippage", DEFAULT_DEX_SLIPPAGE)
+def get_dex_slippage(user_data: Dict) -> Optional[str]:
+    """Get the user's DEX slippage override, or None to use the connector's own setting"""
+    return get_dex_prefs(user_data).get("default_slippage")
 
 
 def set_dex_slippage(user_data: Dict, slippage: str) -> None:
@@ -703,6 +680,9 @@ def get_dex_swap_defaults(user_data: Dict) -> DEXSwapParams:
     1. System defaults
     2. User's configured defaults
     3. Last swap params (highest priority)
+
+    "slippage" is present ONLY when the user set one. Absent means "omit slippage_pct from the
+    Gateway request" so the connector's configured slippage applies.
     """
     prefs = get_dex_prefs(user_data)
     last_swap = prefs.get("last_swap", {})
@@ -711,16 +691,19 @@ def get_dex_swap_defaults(user_data: Dict) -> DEXSwapParams:
         "network", prefs.get("default_network", DEFAULT_DEX_NETWORK)
     )
 
-    return {
+    defaults: DEXSwapParams = {
         "connector": last_swap.get("connector", get_dex_connector(user_data, network)),
         "network": network,
         "trading_pair": last_swap.get("trading_pair", DEFAULT_DEX_PAIR),
         "side": DEFAULT_DEX_SIDE,
         "amount": DEFAULT_DEX_AMOUNT,
-        "slippage": last_swap.get(
-            "slippage", prefs.get("default_slippage", DEFAULT_DEX_SLIPPAGE)
-        ),
     }
+
+    slippage = last_swap.get("slippage", prefs.get("default_slippage"))
+    if slippage is not None:
+        defaults["slippage"] = slippage
+
+    return defaults
 
 
 # ============================================
@@ -950,12 +933,6 @@ def get_executor_deployed_pairs(user_data: Dict) -> List[str]:
     return get_executor_prefs(user_data).get("deployed_pairs", [])
 
 
-def set_executor_deployed_pairs(user_data: Dict, pairs: List[str]) -> None:
-    """Set recently deployed trading pairs"""
-    prefs = _ensure_preferences(user_data)
-    prefs["executors"]["deployed_pairs"] = pairs[:8]
-
-
 def add_executor_deployed_pair(user_data: Dict, pair: str) -> None:
     """Add a trading pair to the front of the deployed pairs list"""
     prefs = _ensure_preferences(user_data)
@@ -1022,14 +999,29 @@ def get_agent_prefs(user_data: Dict) -> "AgentPrefs":
     )
 
 
-def set_default_agent(user_data: Dict, agent_key: str) -> None:
-    """Set default agent"""
+def get_chat_binding(user_data: Dict) -> "ChatBindingPrefs":
+    """What this chat is bound to — see :class:`ChatBindingPrefs`.
+
+    Empty dict when the chat is unbound, which is the coordinator.
+    """
     prefs = _ensure_preferences(user_data)
-    if "agent" not in prefs:
-        prefs["agent"] = {}
-    prefs["agent"]["default_agent"] = agent_key
+    return deepcopy(prefs.get("agent", {}).get("chat_binding") or {})
+
+
+def set_chat_binding(user_data: Dict, binding: "ChatBindingPrefs") -> None:
+    """Merge ``binding`` into the stored record, leaving the other fields alone.
+
+    Merging rather than replacing is what lets each thing a respawn replays be
+    written by whichever handler owns it, without that handler having to know
+    (or preserve) the rest of the record.
+    """
+    prefs = _ensure_preferences(user_data)
+    agent = prefs.setdefault("agent", {})
+    merged = {**(agent.get("chat_binding") or {}), **binding}
+    if merged == agent.get("chat_binding"):
+        return
+    agent["chat_binding"] = merged
     _sync_section_to_cm(user_data, "agent")
-    logger.info(f"Set default agent to {agent_key}")
 
 
 # ============================================
@@ -1161,7 +1153,8 @@ def remove_custom_provider(user_data: Dict, name: str) -> bool:
 def unique_provider_name(user_data: Dict, suggested: str) -> str:
     """Return ``suggested`` (sanitized), suffixed with -2, -3, ... if taken."""
     existing = {
-        sanitize_provider_name(p.get("name", "")) for p in get_custom_providers(user_data)
+        sanitize_provider_name(p.get("name", ""))
+        for p in get_custom_providers(user_data)
     }
     base = sanitize_provider_name(suggested)
     if base not in existing:
@@ -1177,6 +1170,7 @@ def resolve_custom_endpoint(
     agent_key: str,
     user_data: Optional[Dict] = None,
     user_id: Optional[int] = None,
+    strict: bool = False,
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve ``(base_url, api_key)`` for a ``custom@<endpoint>:<model>`` key.
 
@@ -1190,6 +1184,12 @@ def resolve_custom_endpoint(
 
     Pass ``user_data`` when you have it (Telegram handlers) or ``user_id`` when
     you don't (MCP subprocess, web, background agent runs).
+
+    ``strict=True`` raises a :class:`RuntimeError` with an actionable message
+    when the key *names* an endpoint that isn't saved, instead of logging a
+    warning and falling back to the ``CUSTOM_LLM_*`` env vars. Interactive
+    surfaces (chat sessions) want the loud failure; background surfaces
+    (consult, engine) keep the lenient default.
     """
     provider_name, model_id = parse_custom_agent_key(agent_key)
     if not model_id:
@@ -1203,6 +1203,12 @@ def resolve_custom_endpoint(
 
     provider = find_custom_provider(user_data, provider_name) if user_data else None
     if provider is None and provider_name:
+        if strict:
+            raise RuntimeError(
+                f"No saved endpoint named '{provider_name}'. Add it via "
+                "/agent → Change LLM → Custom endpoint, or Settings → "
+                "AI Providers on the web dashboard."
+            )
         logger.warning(
             "Agent key '%s' names endpoint '%s', which is not saved for this user",
             agent_key,
@@ -1340,18 +1346,6 @@ def get_voice_prefs(user_data: Dict) -> "VoicePrefs":
     )
 
 
-def set_voice_prefs(user_data: Dict, **kwargs) -> None:
-    """Update voice preferences. Pass only the keys you want to change."""
-    prefs = _ensure_preferences(user_data)
-    if "voice" not in prefs:
-        prefs["voice"] = {"whisper_model": "small", "language": None, "auto_send": True}
-    for key in ("whisper_model", "language", "auto_send"):
-        if key in kwargs:
-            prefs["voice"][key] = kwargs[key]
-    _sync_section_to_cm(user_data, "voice")
-    logger.info("Updated voice preferences: %s", kwargs)
-
-
 # ============================================
 # PUBLIC API - NOTES (key-value memory for the AI agent)
 # ============================================
@@ -1378,17 +1372,6 @@ def set_note(user_data: Dict, key: str, value: str) -> None:
     logger.info(f"Set note '{key}'")
 
 
-def delete_note(user_data: Dict, key: str) -> bool:
-    """Delete a note by key. Returns True if it existed."""
-    prefs = _ensure_preferences(user_data)
-    notes = prefs.get("notes", {})
-    if key in notes:
-        del notes[key]
-        logger.info(f"Deleted note '{key}'")
-        return True
-    return False
-
-
 # ============================================
 # UTILITY FUNCTIONS
 # ============================================
@@ -1402,8 +1385,3 @@ def clear_preferences(user_data: Dict) -> None:
     user_data.pop(_MIGRATION_DONE_KEY, None)
     user_data.pop("_prefs_hydrated", None)
     logger.info("Cleared all user preferences")
-
-
-def export_preferences(user_data: Dict) -> Dict[str, Any]:
-    """Export all preferences as a dictionary (for debugging/backup)"""
-    return get_preferences(user_data)

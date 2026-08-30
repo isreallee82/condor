@@ -1,27 +1,51 @@
+import { useQuery } from "@tanstack/react-query";
 import { LogOut } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 
+import { AdminSettings } from "@/components/settings/AdminSettings";
 import { ApiKeysSettings } from "@/components/settings/ApiKeysSettings";
 import { CustomProvidersSettings } from "@/components/settings/CustomProvidersSettings";
 import { GatewaySettings } from "@/components/settings/GatewaySettings";
 import { ServersSettings } from "@/components/settings/ServersSettings";
+import { SharingSettings } from "@/components/settings/SharingSettings";
+import { TelemetrySettings } from "@/components/settings/TelemetrySettings";
 import { VoiceSettings } from "@/components/settings/VoiceSettings";
+import { ADMIN_USERS_KEY, adminApi } from "@/lib/admin-api";
 import { useAuth } from "@/lib/auth";
 
 const TABS = [
   { key: "servers", label: "Servers" },
   { key: "gateway", label: "Gateway" },
-  { key: "keys", label: "API Keys" },
+  { key: "keys", label: "Keys and Wallets" },
   { key: "llm", label: "LLM Endpoints" },
   { key: "voice", label: "Voice & AI" },
+  { key: "privacy", label: "Privacy" },
 ] as const;
 
-type TabKey = (typeof TABS)[number]["key"];
+/** Admin-only, appended to TABS when the user turns out to be an admin (ARCH-177). */
+const ADMIN_TAB = { key: "admin", label: "Admin" } as const;
+
+type TabKey = (typeof TABS)[number]["key"] | typeof ADMIN_TAB.key;
 
 export function Settings() {
   const [params, setParams] = useSearchParams();
-  const tab = (params.get("tab") as TabKey) || "servers";
   const { logout } = useAuth();
+
+  // There is no `is_admin` claim on the client, so the admin surface answering
+  // at all is the discriminator: `/admin/users` is 403 for everyone else. The
+  // panel reuses this query key, so opening the tab costs no second request.
+  // Hiding the tab is cosmetic — routes/admin.py re-checks the role every call.
+  const { isSuccess: isAdmin } = useQuery({
+    queryKey: ADMIN_USERS_KEY,
+    queryFn: adminApi.getUsers,
+    retry: false,
+  });
+
+  const tabs = isAdmin ? [...TABS, ADMIN_TAB] : TABS;
+  const requested = (params.get("tab") as TabKey) || "servers";
+  // A deep link to ?tab=admin from a seat that is not (or no longer) an admin
+  // falls back rather than rendering an empty page.
+  const tab = tabs.some((t) => t.key === requested) ? requested : "servers";
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -38,7 +62,7 @@ export function Settings() {
 
       {/* Tab bar */}
       <div className="mb-6 flex gap-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-1">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setParams({ tab: t.key })}
@@ -59,6 +83,19 @@ export function Settings() {
       {tab === "keys" && <ApiKeysSettings />}
       {tab === "llm" && <CustomProvidersSettings />}
       {tab === "voice" && <VoiceSettings />}
+      {/* Two cards, not one switch. Telemetry is anonymous counts the admin
+          consents to install-wide; sharing is content only its author can hand
+          over. They are different promises, and merging the controls would
+          misrepresent one of them — the divider is where the copy says so. */}
+      {tab === "privacy" && (
+        <div className="space-y-8">
+          <TelemetrySettings />
+          <div className="border-t border-[var(--color-border)] pt-8">
+            <SharingSettings />
+          </div>
+        </div>
+      )}
+      {tab === "admin" && <AdminSettings />}
     </div>
   );
 }

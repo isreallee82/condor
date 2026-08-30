@@ -13,9 +13,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 
+from condor.llm.openrouter_models import fetch_models
+from condor.llm.options import DEFAULT_AGENT
+from condor.notifications import Notification, register_push_sink
 from condor.runtime import WEB, EventType, PromptRequest, SessionKey, SessionSpec
 from condor.runtime import client as runtime
 from condor.runtime import conversations
+from condor.runtime.binding import remember_model_choice
 from condor.runtime.confirmations import (
     PendingConfirmation,
     build_permission_callback,
@@ -23,10 +27,9 @@ from condor.runtime.confirmations import (
 )
 from condor.runtime.events import RuntimeEvent
 from condor.runtime.timeouts import TIMEOUTS
+from condor.runtime.wake import register_note_sink, register_sink_factory
 from condor.web.auth import decode_jwt, extract_ws_token, get_current_user
 from condor.web.models import WebUser
-from handlers.agents._shared import DEFAULT_AGENT
-from handlers.agents.openrouter_models import fetch_models
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +53,16 @@ _pending_spawns: dict[str, asyncio.Task] = {}
 # stopping the turn ahead, claiming the task entry — never across the answer
 # itself, which would turn steering into queueing.
 _slot_gates: dict[str, asyncio.Lock] = {}
+
+# Chat sockets currently attached, per user. One socket carries every
+# conversation a user has open, so this is all the addressing a server-initiated
+# turn needs: the slot travels in the frame like it does for a typed turn.
+#
+# The only reason it exists: a turn nobody typed (FEAT-034) has no request to
+# answer into, so it cannot reach a client the way every other event here does.
+# A user with no tab open simply has no entry — the turn still runs and is still
+# recorded, and the dashboard picks it up from the transcript on reconnect.
+_attached_sockets: dict[int, set[WebSocket]] = {}
 
 
 def _session_key(user_id: int, slot_id: str) -> SessionKey:
@@ -214,8 +227,106 @@ class WebSocketChannel:
                 "slot_id": _slot_of(pending.session_key),
                 "request_id": pending.id,
                 "summary": pending.summary,
+                # Which agent, on which server, is asking. The slot addresses
+                # the request; this says out loud what the user is authorizing.
+                "origin": pending.origin,
             },
         )
+
+
+class _WakeSink:
+    """Streams a server-initiated turn into this user's open dashboard tabs.
+
+    Reuses ``_to_ws_message`` verbatim, so a woken turn is indistinguishable on
+    the wire from one the user typed and the shipped dashboard renders it with
+    no protocol change. Broadcast to every socket the user has open for the same
+    reason a typed turn's events are addressed by ``slot_id``: which tab is
+    "the" one is not knowable here, and the client already routes by slot.
+    """
+
+    def __init__(self, user_id: int, slot_id: str):
+        self._user_id = user_id
+        self._slot_id = slot_id
+
+    async def open(self) -> None:
+        return None
+
+    async def on_event(self, event: RuntimeEvent) -> None:
+        message = _to_ws_message(event, self._slot_id)
+        if not message:
+            return
+        for ws in list(_attached_sockets.get(self._user_id, ())):
+            await _send(ws, message)
+
+    async def close(self) -> None:
+        return None
+
+
+def _wake_sink(key: SessionKey, user_id: int | None) -> _WakeSink | None:
+    """Resolve a renderer for a woken web turn, or None if nobody is watching."""
+    if user_id is None or not _attached_sockets.get(user_id):
+        return None
+    return _WakeSink(user_id, key.slot)
+
+
+async def _deliver_note(
+    key: SessionKey, user_id: int | None, text: str, kind: str
+) -> None:
+    """Show an out-of-band transcript note in this user's open tabs.
+
+    A background producer that only records a ``system`` turn — a finished
+    routine, a delegation's outcome — is invisible to a tab that is already
+    open, because the transcript is read at load. This is the push that closes
+    that gap; the event carries the same ``role``/``kind`` pair the hydrated
+    turn does, so a later reload agrees with what was shown live.
+
+    Broadcast to every socket the user has open, addressed by ``slot_id`` like
+    every other chat event (CORR-101): which tab is "the" one is not knowable
+    here, and the client already routes by slot.
+    """
+    if user_id is None:
+        return
+    message = {
+        "event": "system_note",
+        "slot_id": key.slot,
+        "text": text,
+        "kind": kind,
+    }
+    for ws in list(_attached_sockets.get(user_id, ())):
+        await _send(ws, message)
+
+
+async def _push_notification(notification: Notification) -> None:
+    """Light this user's bell in every tab they have open (FEAT-048).
+
+    A third out-of-band push on this socket, next to ``permission_request`` and
+    ``system_note``. Unlike those two it is addressed to the *user*, not to a
+    conversation — a finished background task has no slot — so the frame
+    carries no ``slot_id`` and the store, not this push, is what guarantees the
+    notice is seen: a user with no tab open simply has no entry here, and the
+    bell picks it up from ``GET /notifications`` on the next load.
+    """
+    for ws in list(_attached_sockets.get(notification.user_id, ())):
+        await _send(
+            ws,
+            {
+                "event": "notification",
+                "id": notification.id,
+                "kind": notification.kind,
+                "title": notification.title,
+                "text": notification.text,
+                "link": notification.link,
+                "ts": notification.ts,
+            },
+        )
+
+
+# Registered here rather than imported by the runtime: ``condor.runtime`` must
+# not depend on web or handler code (see ``client._local()``). ``condor.notifications``
+# is registered the same way and for the same reason.
+register_sink_factory(WEB, _wake_sink)
+register_note_sink(WEB, _deliver_note)
+register_push_sink(_push_notification)
 
 
 @router.websocket("/ws/chat")
@@ -242,6 +353,10 @@ async def chat_websocket(ws: WebSocket, token: str | None = Query(default=None))
         return
 
     await ws.accept(subprotocol=accept_subprotocol)
+
+    # Reachable from now until this socket goes away, so a turn started by
+    # something other than this connection can still be rendered on it.
+    _attached_sockets.setdefault(user_id, set()).add(ws)
 
     # Send list of existing alive sessions on connect
     sessions = await _get_user_sessions(user_id)
@@ -291,6 +406,13 @@ async def chat_websocket(ws: WebSocket, token: str | None = Query(default=None))
     except Exception:
         log.exception("Chat WS error for user %d", user_id)
     finally:
+        attached = _attached_sockets.get(user_id)
+        if attached is not None:
+            attached.discard(ws)
+            if not attached:
+                # Dropped rather than left empty: an entry that outlives the
+                # last tab would read as "someone is watching" forever.
+                _attached_sockets.pop(user_id, None)
         # Cancel any in-flight background tasks on disconnect
         for task in bg_tasks:
             task.cancel()
@@ -304,12 +426,17 @@ async def _handle_start_session(
     msg: dict,
 ) -> None:
     """Open a chat on a brand new conversation."""
-    agent_key = msg.get("agent_key", DEFAULT_AGENT)
     server_name = msg.get("server_name")  # From frontend's selected server
     # A dashboard chat can be born already bound to a domain Agent. Without
     # this, "Chat" on an agent's page would have to start-then-switch, which
     # spawns two subprocesses for one click.
     agent_slug = str(msg.get("agent_slug") or "")
+    # A bound Agent brings its own model, so an omitted (or empty) key means
+    # "ask whoever is bound" — the semantics binding.resolve already has for an
+    # empty spec.agent_key. Only an unbound chat needs Condor's default named,
+    # which makes a non-empty key here a *deliberate* pick, worth remembering.
+    picked = str(msg.get("agent_key") or "")
+    agent_key = picked or ("" if agent_slug else DEFAULT_AGENT)
 
     # The conversation is minted first and *is* the slot, so the key
     # web:{user}:{conversation} is stable forever instead of being a throwaway
@@ -331,6 +458,7 @@ async def _handle_start_session(
         agent_slug=agent_slug,
         client_ref=str(msg.get("client_ref") or ""),
     )
+    remember_model_choice(user_id, agent_slug, picked)
 
 
 async def _handle_resume_conversation(
@@ -346,24 +474,52 @@ async def _handle_resume_conversation(
     makes today.
     """
     conversation_id = str(msg.get("conversation_id") or "")
-    try:
-        conv = conversations.get_conversation(user_id, conversation_id)
-    except conversations.ConversationIdError:
-        conv = None
+    conv = _conversation_for(user_id, conversation_id)
     if conv is None:
         await _send(ws, {"event": "error", "message": "No such conversation"})
         return
+
+    picked = str(msg.get("agent_key") or "")
+    agent_key = _resume_agent_key(conv, picked)
 
     await _start(
         ws,
         user_id,
         conv.id,
-        msg.get("agent_key") or conv.agent_key or DEFAULT_AGENT,
+        agent_key,
         msg.get("server_name") or conv.server_name,
         restored=True,
         agent_slug=conv.agent_slug,
         client_ref=str(msg.get("client_ref") or ""),
     )
+    remember_model_choice(user_id, conv.agent_slug, picked)
+
+
+def _conversation_for(
+    user_id: int, conversation_id: str
+) -> conversations.ConversationMeta | None:
+    """This user's conversation record, or None — an unusable id included.
+
+    An id that is not even a safe path is "no such conversation" to every
+    caller here, so the validation error is folded into the same answer.
+    """
+    try:
+        return conversations.get_conversation(user_id, conversation_id)
+    except conversations.ConversationIdError:
+        return None
+
+
+def _resume_agent_key(conv: conversations.ConversationMeta, picked: str) -> str:
+    """Which model answers when a conversation is picked back up.
+
+    A bound conversation resumes on its Agent's *current* model, not on whatever
+    answered last: ``conv.agent_key`` is a record of what answered, never a pin,
+    and honouring it here is what let a reload re-override the Agent with
+    DEFAULT_AGENT. ``picked`` is a deliberate choice by the user and always wins.
+    """
+    if conv.agent_slug:
+        return picked
+    return picked or conv.agent_key or DEFAULT_AGENT
 
 
 async def _start(
@@ -376,7 +532,7 @@ async def _start(
     restored: bool,
     agent_slug: str = "",
     client_ref: str = "",
-) -> None:
+) -> bool:
     """Spawn the session behind a conversation and announce it.
 
     Shared by ``start_session`` and ``resume_conversation``: the two differ only
@@ -387,18 +543,54 @@ async def _start(
     instant the user asks for one, before any id exists, and uses the echo to
     reconcile that optimistic tab with the conversation it turned out to be.
     """
+    # Registered before the first await, so a send_message dispatched in the
+    # same batch of WS frames finds the spawn and waits for it. The task here is
+    # the handler's own — awaiting it means awaiting the whole announce.
+    #
+    # Which is why the reattach in ``_handle_send_message`` calls ``_spawn``
+    # directly instead: registering *that* task would make a second message
+    # wait for the whole answer, not for the spawn, and steering would turn
+    # back into queueing. It holds the slot gate throughout, which is the
+    # serialisation that path actually needs.
+    task_key = f"{user_id}:{conversation_id}"
+    current = asyncio.current_task()
+    if current is not None:
+        _pending_spawns[task_key] = current
+    try:
+        return await _spawn(
+            ws,
+            user_id,
+            conversation_id,
+            agent_key,
+            server_name,
+            restored=restored,
+            agent_slug=agent_slug,
+            client_ref=client_ref,
+        )
+    finally:
+        _pending_spawns.pop(task_key, None)
+
+
+async def _spawn(
+    ws: WebSocket,
+    user_id: int,
+    conversation_id: str,
+    agent_key: str,
+    server_name: str | None,
+    *,
+    restored: bool,
+    agent_slug: str = "",
+    client_ref: str = "",
+) -> bool:
+    """Create the subprocess for one conversation and announce it.
+
+    Returns whether the session is up; a failure has already told the client,
+    so a caller that wanted to continue only needs to stop.
+    """
     # The per-user session cap now lives in the runtime, so Telegram and the
     # dashboard draw on one budget; exceeding it raises out of create_session.
     slot_id = conversation_id
     session_key = _session_key(user_id, slot_id)
-
-    # Registered before the first await, so a send_message dispatched in the
-    # same batch of WS frames finds the spawn and waits for it. The task here is
-    # the handler's own — awaiting it means awaiting the whole announce.
-    task_key = f"{user_id}:{slot_id}"
-    current = asyncio.current_task()
-    if current is not None:
-        _pending_spawns[task_key] = current
 
     perm_cb = build_permission_callback(
         session_key=str(session_key),
@@ -445,6 +637,7 @@ async def _start(
                 "client_ref": client_ref,
             },
         )
+        return True
     except Exception as e:
         log.exception("Failed to start chat session for user %d", user_id)
         await _send(
@@ -458,8 +651,7 @@ async def _start(
                 "slot_id": slot_id,
             },
         )
-    finally:
-        _pending_spawns.pop(task_key, None)
+        return False
 
 
 async def _handle_send_message(
@@ -493,21 +685,68 @@ async def _handle_send_message(
         info = await runtime.get_info(session_key)
 
         if info is None or not info.alive:
-            # Session died — clean up and notify frontend
-            await runtime.destroy(session_key)
-            await _send(
-                ws,
-                {
-                    "event": "error",
-                    "slot_id": slot_id,
-                    "message": "Session ended. Start a new one.",
-                },
+            # No session behind this slot. That is not the same as "gone": the
+            # budget detaches idle sessions on purpose and keeps the
+            # conversation, and a bot restart leaves every one of them on disk.
+            # For a web slot the slot id *is* the conversation id, so if the
+            # record is still there this is a reattach — the same spawn
+            # ``resume_conversation`` does — and the message the user just typed
+            # goes on to be answered instead of being dropped on the floor.
+            if info is not None:
+                # Only a subprocess that really died needs reaping first; a
+                # detached slot has nothing left to tear down.
+                await runtime.destroy(session_key)
+            conv = _conversation_for(user_id, slot_id)
+            if conv is None:
+                await _send(
+                    ws,
+                    {
+                        "event": "error",
+                        "slot_id": slot_id,
+                        "message": "Session ended. Start a new one.",
+                    },
+                )
+                await _send(
+                    ws,
+                    {
+                        "event": "session_destroyed",
+                        "slot_id": slot_id,
+                        "had_session": True,
+                    },
+                )
+                return
+
+            # Said apart from the crash case on purpose: an evicted slot that
+            # reattaches is the budget working, not a fault to go looking for.
+            log.info(
+                "Reattaching %s slot %s for user %d before its message",
+                "dead" if info is not None else "detached",
+                slot_id,
+                user_id,
             )
-            await _send(
+            # ``_spawn`` and not ``_start``: see the note there on why this path
+            # must not register itself as a pending spawn.
+            if not await _spawn(
                 ws,
-                {"event": "session_destroyed", "slot_id": slot_id, "had_session": True},
-            )
-            return
+                user_id,
+                conv.id,
+                _resume_agent_key(conv, ""),
+                conv.server_name,
+                restored=True,
+                agent_slug=conv.agent_slug,
+            ):
+                return
+            info = await runtime.get_info(session_key)
+            if info is None:
+                await _send(
+                    ws,
+                    {
+                        "event": "error",
+                        "slot_id": slot_id,
+                        "message": "Session ended. Start a new one.",
+                    },
+                )
+                return
 
         # This turn owns the slot from here on, so a Stop that arrives next
         # cancels *this* task and not the one it is replacing.

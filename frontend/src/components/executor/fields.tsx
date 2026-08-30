@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -6,6 +6,10 @@ import {
   ChevronUp,
   Crosshair,
 } from "lucide-react";
+
+import { AnchoredMenu } from "@/components/ui/AnchoredMenu";
+
+import { PERCENT_PRESETS, SIDE_OPTIONS } from "./field-options";
 
 // ── Generic dispatch type ──
 
@@ -21,6 +25,7 @@ export function PriceField({
   dispatch,
   valid,
   hint,
+  pickable = true,
 }: {
   label: string;
   value: number;
@@ -29,6 +34,12 @@ export function PriceField({
   dispatch: FieldDispatch;
   valid: boolean;
   hint?: string;
+  /**
+   * Whether this price can be picked off the chart. A panel that has run out of
+   * pick slots turns the crosshair off for the remaining prices rather than
+   * offering a button that does nothing.
+   */
+  pickable?: boolean;
 }) {
   const isActive = activePickField === field;
   const id = useId();
@@ -71,6 +82,7 @@ export function PriceField({
               : "border-[var(--color-border)] focus:border-[var(--color-primary)]"
           }`}
         />
+        {pickable && (
         <button
           onClick={() =>
             dispatch({
@@ -88,8 +100,63 @@ export function PriceField({
         >
           <Crosshair className="h-3.5 w-3.5" />
         </button>
+        )}
       </div>
       {hint && <p className="mt-0.5 text-[10px] text-[var(--color-text-muted)]">{hint}</p>}
+    </div>
+  );
+}
+
+// ── PercentPresets ──
+
+/** Fractions of the available balance the presets offer. */
+
+function formatAvailable(value: number): string {
+  if (value === 0) return "0";
+  if (value >= 1000) return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (value >= 1) return String(Number(value.toFixed(4)));
+  return String(Number(value.toPrecision(4)));
+}
+
+/**
+ * Size a field off the wallet instead of by typing.
+ *
+ * `available === null` means the balance is unknown (not held, or the portfolio
+ * has not arrived): the buttons go inert rather than sizing an order off a zero
+ * that was never a real balance.
+ */
+export function PercentPresets({
+  available,
+  symbol,
+  onPick,
+  label,
+}: {
+  available: number | null;
+  symbol?: string;
+  onPick: (fraction: number) => void;
+  /** Overrides the "Avail" caption — e.g. naming the token being spent. */
+  label?: string;
+}) {
+  const usable = available !== null && available > 0;
+  return (
+    <div className="mt-1 flex items-center gap-1">
+      {PERCENT_PRESETS.map((pct) => (
+        <button
+          key={pct}
+          type="button"
+          disabled={!usable}
+          onClick={() => onPick(pct)}
+          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] py-0.5 text-[10px] text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          {pct * 100}%
+        </button>
+      ))}
+      <span
+        className="ml-1 shrink-0 font-mono text-[10px] text-[var(--color-text-muted)]"
+        title={label ?? "Available balance"}
+      >
+        {available === null ? "—" : formatAvailable(available)} {symbol ?? ""}
+      </span>
     </div>
   );
 }
@@ -162,76 +229,79 @@ export function SelectField({
   field,
   dispatch,
   options,
+  disabled = false,
 }: {
   label: string;
   value: number | string;
   field: string;
   dispatch: FieldDispatch;
   options: { value: number | string; label: string }[];
+  /** A select with nothing to select reads as broken unless it says so. */
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    const keyHandler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", handler);
-    document.addEventListener("keydown", keyHandler);
-    return () => {
-      document.removeEventListener("mousedown", handler);
-      document.removeEventListener("keydown", keyHandler);
-    };
-  }, [open]);
+  // A callback-ref *state* element, not a `useRef`: the menu needs a render to
+  // pass through once the trigger exists, or it has no coordinates to place at.
+  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
+  const close = useCallback(() => setOpen(false), []);
 
   const selected = options.find((o) => o.value === value) ?? options[0];
 
   return (
-    <div ref={containerRef} className="relative">
+    <div>
       <label className="mb-1 block text-xs text-[var(--color-text-muted)]">{label}</label>
       <button
+        ref={setAnchor}
         type="button"
         aria-label={label}
         aria-expanded={open}
         aria-haspopup="listbox"
+        disabled={disabled}
         onClick={() => setOpen(!open)}
-        className="flex w-full items-center justify-between rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-2.5 py-1.5 text-xs text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-hover)]"
+        className={`flex w-full items-center justify-between rounded-lg border border-[var(--color-border)] px-2.5 py-1.5 text-xs transition-colors ${
+          disabled
+            ? "bg-[var(--color-bg)] text-[var(--color-text-muted)] opacity-60"
+            : "bg-[var(--color-surface)] text-[var(--color-text)] hover:bg-[var(--color-surface-hover)]"
+        }`}
       >
         <span>{selected?.label}</span>
-        <ChevronDown className={`h-3.5 w-3.5 text-[var(--color-text-muted)] transition-transform ${open ? "rotate-180" : ""}`} />
+        {!disabled && (
+          <ChevronDown className={`h-3.5 w-3.5 text-[var(--color-text-muted)] transition-transform ${open ? "rotate-180" : ""}`} />
+        )}
       </button>
-      {open && (
-        <div className="absolute z-50 mt-1 max-h-48 w-full overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg">
-          {options.map((opt) => {
-            const isActive = opt.value === value;
-            return (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => {
-                  const asNum = Number(opt.value);
-                  dispatch({ type: "SET_FIELD", field, value: isNaN(asNum) ? opt.value : asNum });
-                  setOpen(false);
-                }}
-                className={`flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs transition-colors ${
-                  isActive
-                    ? "bg-[var(--color-primary)]/10 text-[var(--color-primary)]"
-                    : "text-[var(--color-text)] hover:bg-[var(--color-surface-hover)]"
-                }`}
-              >
-                {isActive && <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-primary)]" />}
-                <span className={isActive ? "" : "ml-3.5"}>{opt.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+      <AnchoredMenu
+        anchor={anchor}
+        open={open && !disabled}
+        onClose={close}
+        matchAnchorWidth="exact"
+        maxHeight={192}
+        role="listbox"
+      >
+        {options.map((opt) => {
+          const isActive = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              role="option"
+              aria-selected={isActive}
+              onClick={() => {
+                const asNum = Number(opt.value);
+                dispatch({ type: "SET_FIELD", field, value: isNaN(asNum) ? opt.value : asNum });
+                setOpen(false);
+              }}
+              className={`flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs transition-colors ${
+                isActive
+                  ? "bg-[var(--color-primary)]/10 text-[var(--color-primary)]"
+                  : "text-[var(--color-text)] hover:bg-[var(--color-surface-hover)]"
+              }`}
+            >
+              {isActive && <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-primary)]" />}
+              <span className={isActive ? "" : "ml-3.5"}>{opt.label}</span>
+            </button>
+          );
+        })}
+      </AnchoredMenu>
     </div>
   );
 }
@@ -339,6 +409,8 @@ export function AmountField({
   step = 0.001,
   min = 0,
   pair,
+  baseSymbol,
+  quoteSymbol,
 }: {
   value: number;
   field: string;
@@ -347,13 +419,20 @@ export function AmountField({
   step?: number;
   min?: number;
   pair?: string;
+  /**
+   * Token tickers, when the pair cannot supply them. A DEX `trading_pair` is
+   * `<base_mint>-<quote_symbol>`, so splitting it labels the field with a mint
+   * address.
+   */
+  baseSymbol?: string;
+  quoteSymbol?: string;
 }) {
   const [inQuote, setInQuote] = useState(false);
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const baseAsset = pair?.split("-")[0] ?? "base";
-  const quoteAsset = pair?.split("-")[1] ?? "quote";
+  const baseAsset = baseSymbol ?? pair?.split("-")[0] ?? "base";
+  const quoteAsset = quoteSymbol ?? pair?.split("-")[1] ?? "quote";
 
   // When inQuote mode, show quote value; dispatch always stores base amount
   const displayValue = inQuote && currentPrice && currentPrice > 0 ? value * currentPrice : value;
@@ -457,18 +536,18 @@ export function LeverageField({
 
 // ── Shared constants ──
 
-export const ORDER_TYPE_OPTIONS = [
-  { value: 1, label: "Market" },
-  { value: 2, label: "Limit" },
-  { value: 3, label: "Limit Maker" },
-];
 
-export const SIDE_OPTIONS = [
-  { value: 1, label: "LONG", color: "var(--color-green)" },
-  { value: 2, label: "SHORT", color: "var(--color-red)" },
-];
 
-export function SideSelector({ side, dispatch }: { side: 1 | 2; dispatch: FieldDispatch }) {
+export function SideSelector({
+  side,
+  dispatch,
+  isSpot = false,
+}: {
+  side: 1 | 2;
+  dispatch: FieldDispatch;
+  /** Spot has no position to be long or short of — the sides are Buy and Sell. */
+  isSpot?: boolean;
+}) {
   return (
     <div>
       <SectionHeader>Direction</SectionHeader>
@@ -484,7 +563,7 @@ export function SideSelector({ side, dispatch }: { side: 1 | 2; dispatch: FieldD
             }`}
             style={side === opt.value ? { backgroundColor: opt.color } : undefined}
           >
-            {opt.label}
+            {isSpot ? (opt.value === 1 ? "BUY" : "SELL") : opt.label}
           </button>
         ))}
       </div>
