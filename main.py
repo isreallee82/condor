@@ -911,11 +911,25 @@ def main() -> None:
     # In local mode there is no token and nothing polls; the placeholder exists
     # only so the Application (and with it job_queue, CallbackContext and the
     # handler registry) can be built at all. Nothing ever calls Telegram with it.
+    # Explicit HTTP timeouts. python-telegram-bot defaults to 5s connect/read and
+    # 1s pool, which is optimistic for anything outside a datacentre: on a link
+    # where the TLS handshake alone costs ~1s and a round trip 1.5-2.6s, the very
+    # first call Condor makes -- Bot.get_me() inside Application.initialize() --
+    # sits close enough to the limit that an ordinary jitter spike raises
+    # telegram.error.TimedOut and kills the whole process before any of Condor's
+    # own logging starts. That failure is intermittent, so it reads as random
+    # startup death, and `make run` reports success because the tmux session was
+    # created before the process died inside it.
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN or "0:local")
         .persistence(persistence)
         .concurrent_updates(True)
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
+        .write_timeout(20.0)
+        .pool_timeout(20.0)
+        .get_updates_connect_timeout(20.0)
         .build()
     )
 
