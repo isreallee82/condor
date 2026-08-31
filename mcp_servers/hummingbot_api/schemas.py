@@ -62,7 +62,12 @@ class ManageExecutorsRequest(BaseModel):
 
     executor_config: dict[str, Any] | None = Field(
         default=None,
-        description="Configuration for creating an executor. Required for 'create' action.",
+        description=(
+            "Configuration for creating an executor. Required for 'create' action. "
+            "Do NOT put controller_id here - pass it as the top-level controller_id "
+            "argument instead; it is written into this config for you. A controller_id "
+            "included here anyway is accepted, but must match the top-level one."
+        ),
     )
 
     executor_id: str | None = Field(
@@ -150,7 +155,17 @@ class ManageExecutorsRequest(BaseModel):
 
     controller_id: str | None = Field(
         default=None,
-        description="Controller ID that owns this executor. Used for create, positions_summary, get_position, clear_position, and performance_report.",
+        description=(
+            "TOP-LEVEL controller ID that owns this executor - not a field of "
+            "executor_config. Used for create, positions_summary, get_position, "
+            "clear_position, and performance_report. On 'create' this value is also "
+            "written into executor_config so the executor's own config and its record "
+            "agree. An agent must pass its own agent_id: controller_id is what scopes "
+            "per-controller PnL, open-executor counts, position scans and emergency "
+            "exits. Omit it only to deliberately use the shared 'main' bucket. On "
+            "'create' a blank or unusable value is rejected rather than silently "
+            "defaulted to 'main'; the read-only actions pass it through unvalidated."
+        ),
     )
 
     controller_ids: list[str] | None = Field(

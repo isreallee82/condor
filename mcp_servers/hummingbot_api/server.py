@@ -742,7 +742,9 @@ async def manage_executors(
 
     Actions:
     - (none) + executor_type → Show full guide, config schema, and saved defaults
-    - create + executor_config → Create executor (merged with saved defaults)
+    - create + executor_config → Create executor (merged with saved defaults).
+      Pass controller_id as a TOP-LEVEL argument, NOT inside executor_config
+      (it is accepted in either place, but top-level is the documented one)
     - search → List/filter executors (add executor_id for detail)
     - stop + executor_id → Stop executor (with keep_position option)
     - get_logs + executor_id → Get logs (active executors only)
@@ -774,7 +776,16 @@ async def manage_executors(
         account_name: Account name for creating executors (default: 'master_account').
         connector_name: Connector name for position filtering or clearing.
         trading_pair: Trading pair for position filtering or clearing.
-        controller_id: Controller ID that owns the executor. Used for create, positions_summary, clear_position, and performance_report.
+        controller_id: TOP-LEVEL argument naming the controller that owns the executor - not a field of
+            executor_config. Used for create, positions_summary, clear_position, and performance_report.
+            On 'create' the value you pass here is also written into executor_config for you, so the
+            executor's own config and its record agree; you do not need to repeat it there. If you do
+            repeat it, the two must be identical or the create is rejected.
+            An agent MUST pass its own agent_id here. controller_id is what scopes per-controller PnL,
+            open-executor counts, position scans and emergency exits, so omitting it puts your executor
+            in the shared 'main' bucket alongside every other caller's. Omit it only when you genuinely
+            want 'main'. On 'create' a blank or unusable value is rejected rather
+            than silently defaulted; the read-only actions pass it through unvalidated.
         controller_ids: Filter by controller IDs (for search).
     """
     # Create and validate request using Pydantic model

@@ -66,6 +66,95 @@ def _validate_level(
             _validate_level(config[key], prop_schema, key, errors)
 
 
+class ControllerIdError(ValueError):
+    """A caller-supplied controller_id could not be honoured.
+
+    Raised instead of quietly falling back to "main". The shared "main" bucket is
+    what per-controller PnL, open-executor counts, position scans and emergency
+    exits are all scoped by, so silently booking an executor there mis-states risk
+    for every controller at once - and does it invisibly.
+    """
+
+
+def resolve_controller_id(
+    top_level: Any,
+    caller_config: dict[str, Any] | None,
+    merged_config: dict[str, Any],
+) -> tuple[str, str]:
+    """Resolve which controller owns a new executor.
+
+    `controller_id` is accepted in two places because callers legitimately use
+    both: the top-level `controller_id` argument (preferred) and nested inside
+    `executor_config`. Either is honoured; supplying both is fine as long as they
+    agree. A `controller_id` sitting in the saved executor defaults acts as a
+    lower-priority fallback, below anything the caller passed on this call.
+
+    Args:
+        top_level: the request's top-level `controller_id`.
+        caller_config: the caller's own `executor_config`, before defaults were
+            merged in - used so a saved default never conflicts with an explicit
+            argument.
+        merged_config: `executor_config` after defaults were merged in.
+
+    Returns:
+        `(controller_id, source)` - the resolved id, plus a short label naming
+        where it came from, for logging.
+
+    Raises:
+        ControllerIdError: if the caller named controller_id but no usable value
+            can be taken from it - every value blank or non-string, or two usable
+            values that disagree. These are refused loudly rather than defaulted
+            to "main". A `null` in one place is ignored when the other place holds
+            a usable value.
+    """
+    # Everywhere the caller named controller_id on this call, in priority order.
+    named: list[tuple[str, Any]] = []
+    if top_level is not None:
+        named.append(("the top-level controller_id argument", top_level))
+    if caller_config is not None and "controller_id" in caller_config:
+        named.append(
+            ("executor_config['controller_id']", caller_config["controller_id"])
+        )
+
+    usable = [
+        (source, value.strip())
+        for source, value in named
+        if isinstance(value, str) and value.strip()
+    ]
+
+    if usable:
+        distinct = {value for _, value in usable}
+        if len(distinct) > 1:
+            detail = " and ".join(f"{source} = {value!r}" for source, value in usable)
+            raise ControllerIdError(
+                f"Conflicting controller_id: {detail}. Refusing to guess which one "
+                "owns the executor - picking either would split this controller's "
+                "executors across two buckets. Pass the same controller_id in both "
+                "places, or in only one."
+            )
+        return usable[0][1], usable[0][0]
+
+    if named:
+        # The caller meant to set an owner but gave nothing usable. Falling back to
+        # "main" here is precisely the silent mis-booking this guard exists to stop.
+        detail = " and ".join(f"{source} = {value!r}" for source, value in named)
+        raise ControllerIdError(
+            f"controller_id was supplied but is not a usable identifier: {detail}. "
+            "Refusing to fall back to 'main': that would book this executor in the "
+            "shared bucket and silently corrupt per-controller PnL, open-executor "
+            "counts and position scans. Pass a non-empty controller_id string, or "
+            "omit the argument entirely to deliberately use 'main'."
+        )
+
+    # Nothing supplied by the caller. Fall back to a saved default if one exists,
+    # then to "main" - the genuine no-controller case, unchanged from before.
+    from_defaults = merged_config.get("controller_id")
+    if isinstance(from_defaults, str) and from_defaults.strip():
+        return from_defaults.strip(), "saved executor defaults"
+
+    return "main", "default (nothing supplied)"
+
+
 async def manage_executors(
     client: Any, request: ManageExecutorsRequest
 ) -> dict[str, Any]:
@@ -186,16 +275,34 @@ async def manage_executors(
             pass  # If schema fetch fails, skip validation
 
         account = request.account_name or "master_account"
-        # Check both top-level param and executor_config (agents sometimes put it in the wrong place)
-        controller_id = (
-            request.controller_id or merged_config.pop("controller_id", None) or "main"
-        )
 
-        import logging as _logging
+        try:
+            controller_id, controller_id_source = resolve_controller_id(
+                request.controller_id, request.executor_config, merged_config
+            )
+        except ControllerIdError as e:
+            return {
+                "action": "create",
+                "error": str(e),
+                "formatted_output": f"Error: {e}",
+            }
 
-        _logging.getLogger(__name__).info(
-            "create_executor: controller_id=%r (request=%r, config_had=%r), type=%s, account=%s",
+        # Write the resolved owner back INTO the config. This is the load-bearing
+        # line, not the keyword argument below: the backend stores the sibling
+        # `controller_id` on the executor's record, but the executor object itself
+        # is built from `executor_config`, and `ExecutorConfigBase.controller_id`
+        # hard-defaults to "main". A config without the field therefore produces an
+        # executor whose own identity - and the `config` block echoed back by
+        # search/detail, the only place callers can read it - says "main" no matter
+        # what was passed alongside it. That is what made the top-level argument
+        # look like it was being ignored.
+        merged_config["controller_id"] = controller_id
+
+        logger.info(
+            "create_executor: controller_id=%r (from %s; request=%r, config_had=%r), "
+            "type=%s, account=%s",
             controller_id,
+            controller_id_source,
             request.controller_id,
             "controller_id" in (request.executor_config or {}),
             executor_type,
@@ -221,6 +328,12 @@ async def manage_executors(
             formatted += f"Executor ID: {executor_id or 'N/A'}\n"
             formatted += f"Type: {executor_type}\n"
             formatted += f"Account: {account}\n"
+            # Show the OWNER that was actually resolved. Without this the caller has
+            # no way to confirm it on create -- the only readback is a separate
+            # `search` for the id -- which is how every executor silently booking
+            # under "main" went unnoticed for a whole session. An agent told to
+            # verify its controller_id needs something here to verify against.
+            formatted += f"Controller ID: {controller_id}\n"
 
             if request.save_as_default:
                 formatted += f"\nConfiguration saved as default for {executor_type}"

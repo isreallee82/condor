@@ -312,9 +312,9 @@ def _probe_error(e: BaseException, cap: float = PROBE_TIMEOUT_SEC) -> tuple[str,
     No code here ever means "OK". Every one of them means the observation could
     not be made, and for the exit-liquidity check an observation that could not
     be made is the same as "not safe to enter": a timeout says nothing about the
-    book, and on this venue 53 of ~56 MARKET closes were refused. The executor's
-    own take_profit / stop_loss / time_limit barriers are no fallback — they
-    close with MARKET orders too, the exact order type that was refused.
+    book. The executor's own take_profit / stop_loss / time_limit barriers are no
+    fallback either — every one of them closes with a MARKET order (see
+    _build_ladder), so they cannot rescue an exit the venue will not take.
     """
     name = type(e).__name__
     # ConnectionTimeoutError SUBCLASSES TimeoutError, so it has to be tested
@@ -583,8 +583,10 @@ def _build_ladder(config: Config, signal: dict) -> tuple[dict | None, str]:
     # anchored to that venue's own price. The candle close belongs to the proxy
     # feed and carries cross-venue basis, USDT-vs-USDC quote basis, and up to a
     # full bar of staleness — regularly more than the near rung's own offset,
-    # which posts a MAKER buy above the market: rejected post-only, or filled as
-    # a taker on a strategy whose take-profit floor is sized for maker fees.
+    # which posts a MAKER buy above the market. The rung is a plain OrderType.LIMIT,
+    # not LIMIT_MAKER (see the contract note below), so it is not rejected post-only:
+    # it crosses and fills as a TAKER, on a strategy whose take-profit floor is sized
+    # for maker fees.
     price = signal.get("exec_price")
     if not price or price <= 0:
         return None, ("no execution-venue price is available — the candle feed is a proxy "
@@ -606,6 +608,51 @@ def _build_ladder(config: Config, signal: dict) -> tuple[dict | None, str]:
     amounts = [round(config.total_amount_quote * w, 4) for w in weights]
 
     take_profit = max(config.take_profit * mult, config.min_take_profit)
+    # NO order-type keys are emitted here, and none may be added. Checked against
+    # the DCAExecutorConfig the live API validates against (copied out of the
+    # hummingbot-api image itself, strategy_v2/executors/dca_executor/
+    # data_types.py): the accepted fields are connector_name, trading_pair, side,
+    # leverage, amounts_quote, prices, take_profit, stop_loss, trailing_stop,
+    # time_limit, mode, activation_bounds, level_id, plus id / type / timestamp /
+    # controller_id from ExecutorConfigBase. There is NO triple_barrier_config and
+    # NO *_order_type field of any kind — that block belongs to position_executor
+    # and grid_executor, and the grid example in executor_preferences.py proves it
+    # for grid only. ExecutorConfigBase is a plain pydantic BaseModel, so
+    # extra="ignore" is in force: a nested triple_barrier_config OR a flat
+    # take_profit_order_type is dropped in silence. Nothing upstream catches it
+    # either — the API's schema endpoint returns {fields, nested_types}, not
+    # {properties}, so the MCP pre-flight validate_executor_config finds no
+    # properties and passes everything — and the create still reports success. The
+    # block would assert a post-only exit that was never configured.
+    #
+    # What this executor actually does, from that same source: in MAKER mode the
+    # rungs go out as OrderType.LIMIT (NOT LIMIT_MAKER — nothing here is post-only
+    # by contract), and place_close_order hardcodes OrderType.MARKET, so
+    # take_profit, stop_loss, time_limit, trailing_stop and early_stop ALL close
+    # taker. Upstream's control_take_profit docstring ("Take profit order is limit
+    # type only") is false against the code three calls below it; do not size fees
+    # off it. A post-only take-profit is not reachable through dca_executor config
+    # at all — it would take a different executor type, not another key here.
+    #
+    # RE-VERIFIED 2026-08-31 against the image that serves server 'local'
+    # (hummingbot/hummingbot-api:latest, sha256:62d70399bf8e, port 8000), so the
+    # next reader does not have to redo it. Exact citations, all inside that image:
+    #   .../strategy_v2/executors/dca_executor/data_types.py — DCAExecutorConfig
+    #     lists thirteen fields and neither triple_barrier_config nor any
+    #     *_order_type; ExecutorConfigBase (executors/data_types.py) declares no
+    #     model_config, so pydantic v2's extra="ignore" applies.
+    #   .../dca_executor/dca_executor.py — open_order_type returns OrderType.LIMIT
+    #     in MAKER mode, close_order_type and place_close_order return/pass
+    #     OrderType.MARKET.
+    #   hummingbot-api/services/executor_service.py — create builds the config as
+    #     config_class(**executor_config), which DROPS unknown keys instead of
+    #     raising; hummingbot-api/routers/executors.py — the schema endpoint
+    #     answers {executor_type, config_class, description, fields, nested_types},
+    #     confirming the MCP pre-flight has no "properties" to check against.
+    # Where the barrier block IS real: GridExecutorConfig requires
+    # triple_barrier_config and PositionExecutorConfig defaults one — and even
+    # there TripleBarrierConfig.take_profit_order_type DEFAULTS TO MARKET, so
+    # "post-only by default" is not a property of any of these executors.
     return {
         "side": side,
         "prices": prices,
@@ -671,11 +718,21 @@ async def _read_exit_book(client, connector_name: str, trading_pair: str,
 
     Can the book absorb the exit we are about to owe?
 
-    The entry is a resting maker ladder and always fills politely. The exit is a
-    market order, and a venue will reject it outright when there is no liquidity
-    inside its price band. On derive_perpetual XRP-USDC that killed 53 of ~56
-    closes: 21 entry fills against 3 close fills, positions opened that could not
-    be exited. Sizing has to be judged against the exit, not the entry.
+    The entry is a resting limit ladder and fills politely. The exit is always a
+    MARKET order (place_close_order hardcodes it — see _build_ladder), and a
+    market order needs a book to land in, so sizing has to be judged against the
+    exit rather than the entry.
+
+    The history this probe was built for: on derive_perpetual XRP-USDC an early
+    run recorded 21 entry fills against 3 close fills. This docstring used to
+    name thin liquidity as the cause of those refusals; that is DISPROVED — the
+    book here measures ~19.8k-26.8k quote within the band against a 70
+    requirement, essentially every tick, and session 7 opened a three-rung LONG
+    and CLOSED it MARKET at -$0.31 realised. So MARKET closes are not currently
+    failing, the cause of the old refusals is NOT established, and nothing here
+    may assert one. The probe is kept because a book too thin to absorb the exit
+    is still a real way to end up in a position you cannot close — it is a
+    pre-condition worth checking, not a diagnosis of that episode.
 
     `state` is one of:
       OK          — the book was read and can absorb `notional`
@@ -1339,8 +1396,9 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     elif liq["state"] != "OK":
         # The structural gate. A ladder is a submittable instruction, so it is
         # withheld whenever the exit book is not verified deep enough to close
-        # what it would open — the failure that produced 21 entry fills against
-        # 3 closes. The decision itself is still reported, so nothing is hidden.
+        # what it would open. (The 21-entries-against-3-closes episode is what
+        # prompted the gate; it is NOT evidence that thin depth caused it — see
+        # _read_exit_book.) The decision is still reported, so nothing is hidden.
         if liq["code"] == "NOT_SIZED":
             # Distinct from a failed probe and from a thin book: the book was
             # read fine, there was simply no size to judge it against.

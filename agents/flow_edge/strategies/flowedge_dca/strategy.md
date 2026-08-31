@@ -80,7 +80,7 @@ naming the gate that stopped it. No block means no entry — see rule 9.
 | `components` | Per-feature contributions: cfi, vwap, trend, di, funding |
 | `natr_pct`, `vol_multiplier` | Live volatility and the resulting scaling factor |
 | `rsi` | Overbought/oversold reading |
-| JSON block | `side`, `prices`, `amounts_quote`, `leverage`, `stop_loss`, `take_profit`, `time_limit`, `mode` |
+| JSON block | `side`, `prices`, `amounts_quote`, `leverage`, `stop_loss`, `take_profit`, `time_limit`, `mode` — and deliberately **no order-type keys**. `dca_executor` has no `triple_barrier_config` and no `*_order_type` field, so one added there is dropped in silence. Its rungs rest as plain LIMIT and **every** barrier exit — take-profit, stop-loss, time limit — closes MARKET |
 
 If the routine returns an error or a warm-up message, **HOLD** and journal one line.
 Never improvise a signal from raw candles.
@@ -209,6 +209,22 @@ routine bug, not something to hand-trim.
 Do not recompute prices or barriers — they are already volatility-scaled and
 fee-floored. If the routine's prices violate the direction rule against the live
 price, HOLD and journal it rather than "fixing" them.
+
+Do not add **order-type** fields — no `triple_barrier_config`, no
+`take_profit_order_type`. `dca_executor` accepts neither: the extra key is discarded
+without an error and the create still reports success, so adding one buys you a
+post-only exit the executor never places. Take-profit, stop-loss and time limit all
+close with MARKET orders; that is the executor, not a default you can override. A
+`triple_barrier_config` example you meet elsewhere is for `position_executor` or
+`grid_executor` — those config classes really carry it — and it does not transfer
+here.
+
+This does **not** apply to the call fields `manage_executors` requires around the
+block — `connector_name`, `trading_pair`, `controller_id`, `executor_type`. Those are
+not part of the routine's JSON and you must still supply them; see AGENT.md.
+`controller_id` is your `agent_id` and never `"main"`: it is what isolates your
+executors and P&L, so check what the create returns and journal it if it comes back
+as anything else.
 
 ---
 
